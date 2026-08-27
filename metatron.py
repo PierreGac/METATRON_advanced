@@ -7,6 +7,8 @@ Run with: python metatron.py
 from export import export_menu
 import os
 import sys
+from contextlib import contextmanager
+from pathlib import Path
 from db import (
     get_connection,
     create_session,
@@ -33,6 +35,8 @@ from db import (
 from tools import collect_install_status, interactive_tool_run, format_recon_for_llm, run_default_recon
 from llm import analyse_target, MODEL_NAME, OLLAMA_URL
 
+LAST_RUN_LOG = Path(__file__).resolve().parent / "last_run.log"
+
 
 # ─────────────────────────────────────────────
 # BANNER
@@ -49,8 +53,8 @@ def banner():
     ██║ ╚═╝ ██║███████╗   ██║   ██║  ██║   ██║   ██║  ██║╚██████╔╝██║ ╚████║
     ╚═╝     ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
 \033[0m
-    \033[90mAI Penetration Testing Assistant  |  Model: metatron-qwen  |  Parrot OS\033[0m
-    \033[90m─────────────────────────────────────────────────────────────────────\033[0m
+    \033[90mAI Penetration Testing Assistant  |  Advanced Edition  |  Model: metatron-qwen  |  Parrot OS\033[0m
+    \033[90m─────────────────────────────────────────────────────────────────────────────────────────\033[0m
 """)
 
 
@@ -90,6 +94,60 @@ def confirm(question: str) -> bool:
     return ans == "y"
 
 
+class _TeeStream:
+    """Write to the live console and a log file at the same time."""
+
+    def __init__(self, primary, log_file):
+        self.primary = primary
+        self.log_file = log_file
+
+    def write(self, data):
+        self.primary.write(data)
+        self.primary.flush()
+        try:
+            self.log_file.write(data)
+            self.log_file.flush()
+        except OSError:
+            pass
+        return len(data) if isinstance(data, str) else 0
+
+    def flush(self):
+        self.primary.flush()
+        try:
+            self.log_file.flush()
+        except OSError:
+            pass
+
+    def isatty(self):
+        return bool(getattr(self.primary, "isatty", lambda: False)())
+
+    def fileno(self):
+        return self.primary.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self.primary, name)
+
+
+@contextmanager
+def scan_console_log():
+    """Copy recon + AI console output to last_run.log (overwrite each scan)."""
+    orig_out, orig_err = sys.stdout, sys.stderr
+    fh = None
+    try:
+        fh = open(LAST_RUN_LOG, "w", encoding="utf-8", errors="replace")
+        sys.stdout = _TeeStream(orig_out, fh)
+        sys.stderr = _TeeStream(orig_err, fh)
+        yield LAST_RUN_LOG
+    finally:
+        sys.stdout = orig_out
+        sys.stderr = orig_err
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+
 # ─────────────────────────────────────────────
 # NEW SCAN
 # ─────────────────────────────────────────────
@@ -113,19 +171,18 @@ def new_scan():
     sl_no = create_session(target)
     success(f"Session created — SL# {sl_no}")
 
-    # run recon tools
-    divider("RECON")
-    info("Choose recon tools to run:")
-    raw_scan = interactive_tool_run(target)
+    with scan_console_log():
+        divider("RECON")
+        info("Choose recon tools to run:")
+        raw_scan = interactive_tool_run(target)
 
-    if not raw_scan.strip():
-        warn("No scan data collected. Aborting.")
-        delete_full_session(sl_no)
-        return
+        if not raw_scan.strip():
+            warn("No scan data collected. Aborting.")
+            delete_full_session(sl_no)
+            return
 
-    # send to AI
-    divider("AI ANALYSIS")
-    result = analyse_target(target, raw_scan)
+        divider("AI ANALYSIS")
+        result = analyse_target(target, raw_scan)
 
     # ── save everything to DB ──────────────────
     divider("SAVING TO DATABASE")
