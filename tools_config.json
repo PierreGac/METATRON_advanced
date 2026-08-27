@@ -84,7 +84,9 @@
     "extra_args": []
   },
   "wapiti": {
-    "timeout": 420,
+    "timeout": 120,
+    "idle_reset": true,
+    "max_timeout": 3600,
     "args": ["-u", "{url}", "-v", "2"],
     "extra_args": []
   },

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
@@ -84,7 +85,13 @@ DEFAULT_CONFIG = {
         "args": ["-u", "{url}", "--batch", "--crawl={crawl}"],
         "extra_args": [],
     },
-    "wapiti": {"timeout": 420, "args": ["-u", "{url}", "-v", "2"], "extra_args": []},
+    "wapiti": {
+        "timeout": 120,
+        "idle_reset": True,
+        "max_timeout": 3600,
+        "args": ["-u", "{url}", "-v", "2"],
+        "extra_args": [],
+    },
     "dalfox": {"timeout": 300, "args": ["url", "{url}"], "extra_args": []},
     "commix": {"timeout": 600, "args": ["--url", "{url}", "--batch"], "extra_args": []},
     "wpscan": {"timeout": 300, "args": ["--url", "{url}"], "extra_args": []},
@@ -486,16 +493,54 @@ def _append_log_file(tool_name: str, text: str) -> None:
 # BASE RUNNER
 # ─────────────────────────────────────────────
 
+def _wait_process(proc, timeout: int, idle_reset: bool, max_timeout: int, activity: dict) -> bool:
+    """
+    Wait until the process exits. Return True if we killed it for timeout.
+    Wall-clock timeout unless idle_reset: then `timeout` is silence, max_timeout is the hard cap.
+    """
+    start = time.monotonic()
+    if not idle_reset:
+        try:
+            proc.wait(timeout=timeout)
+            return False
+        except subprocess.TimeoutExpired:
+            return True
+
+    idle_limit = max(int(timeout or 0), 1)
+    hard_limit = int(max_timeout or 0)
+    while proc.poll() is None:
+        now = time.monotonic()
+        elapsed = now - start
+        if hard_limit and elapsed >= hard_limit:
+            return True
+        idle = now - activity["t"]
+        if idle >= idle_limit:
+            return True
+        slice_t = min(0.5, idle_limit - idle)
+        if hard_limit:
+            slice_t = min(slice_t, hard_limit - elapsed)
+        if slice_t <= 0:
+            return True
+        try:
+            proc.wait(timeout=slice_t)
+        except subprocess.TimeoutExpired:
+            continue
+    return False
+
+
 def run_tool(
     command: list,
     timeout: int = 120,
     tool_name: str = "",
     allow_retry: bool = False,
     _retried: bool = False,
+    idle_reset: bool = False,
+    max_timeout: int = 0,
 ) -> str:
     """
     Execute a command, stream stdout+stderr live, save full log to disk,
     return a (possibly truncated) string for the LLM.
+    timeout is wall-clock seconds, or silence seconds when idle_reset is True.
     """
     if not command:
         return "[!] Empty command."
@@ -513,6 +558,8 @@ def run_tool(
     captured = []
     timed_out = False
     proc = None
+    activity = {"t": time.monotonic()}
+    started = time.monotonic()
 
     try:
         proc = subprocess.Popen(
@@ -529,16 +576,15 @@ def run_tool(
             if proc.stdout is None:
                 return
             for line in iter(proc.stdout.readline, ""):
+                activity["t"] = time.monotonic()
                 print(line, end="", flush=True)
                 captured.append(line)
                 _append_log_file(name, line)
 
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        timed_out = _wait_process(proc, timeout, idle_reset, max_timeout, activity)
+        if timed_out:
             proc.kill()
             try:
                 proc.wait(timeout=5)
@@ -569,7 +615,14 @@ def run_tool(
 
     body = "".join(captured).rstrip()
     if timed_out:
-        notice = f"[!] Timed out after {timeout}s: {display}"
+        elapsed = int(time.monotonic() - started)
+        if idle_reset:
+            notice = (
+                f"[!] Idle timeout after {timeout}s with no output "
+                f"(ran {elapsed}s): {display}"
+            )
+        else:
+            notice = f"[!] Timed out after {timeout}s: {display}"
         print(notice)
         _append_log_file(name, notice + "\n")
         partial = body + ("\n" if body else "") + notice
@@ -577,6 +630,7 @@ def run_tool(
         if allow_retry and not _retried:
             multiplier = float(global_cfg.get("timeout_retry_multiplier", 2) or 2)
             bumped = max(int(timeout * multiplier), timeout + 1)
+            bumped_max = int(max_timeout * multiplier) if max_timeout else 0
             choice = input(
                 f"Timed out after {timeout}s. Retry with timeout={bumped}? [y/N/e]: "
             ).strip().lower()
@@ -588,11 +642,15 @@ def run_tool(
                     tool_name=name,
                     allow_retry=False,
                     _retried=True,
+                    idle_reset=idle_reset,
+                    max_timeout=bumped_max or max_timeout,
                 )
             if choice == "e":
                 prompt_edit_config([name])
                 new_cfg = get_tool_config(name)
                 new_timeout = int(new_cfg.get("timeout", bumped) or bumped)
+                new_idle = bool(new_cfg.get("idle_reset", idle_reset))
+                new_max = int(new_cfg.get("max_timeout", max_timeout) or 0)
                 print(f"[*] Retrying with timeout={new_timeout}s from config...")
                 return run_tool(
                     command,
@@ -600,6 +658,8 @@ def run_tool(
                     tool_name=name,
                     allow_retry=False,
                     _retried=True,
+                    idle_reset=new_idle,
+                    max_timeout=new_max,
                 )
         return _truncate_log(partial, max_lines)
 
@@ -658,7 +718,14 @@ def _run_configured(binary: str, target: str, allow_retry: bool = True) -> str:
     argv0 = resolve_tool_binary(binary)
     command = _finalize_command(binary, build_command(argv0, target, cfg), target)
     print(f"  [*] {' '.join(str(c) for c in command)}")
-    output = run_tool(command, timeout=timeout, tool_name=binary, allow_retry=allow_retry)
+    output = run_tool(
+        command,
+        timeout=timeout,
+        tool_name=binary,
+        allow_retry=allow_retry,
+        idle_reset=bool(cfg.get("idle_reset")),
+        max_timeout=int(cfg.get("max_timeout") or 0),
+    )
     if binary == "gobuster":
         output = _retry_gobuster_wildcard(output, command, timeout)
     return output
@@ -1098,7 +1165,14 @@ def run_tool_by_command(command_str: str) -> str:
     if target not in joined and _http_url(target) not in joined:
         command.append(target)
     print(f"  [*] {' '.join(str(c) for c in command)}")
-    output = run_tool(command, timeout=timeout, tool_name=config_key, allow_retry=False)
+    output = run_tool(
+        command,
+        timeout=timeout,
+        tool_name=config_key,
+        allow_retry=False,
+        idle_reset=bool(cfg.get("idle_reset")),
+        max_timeout=int(cfg.get("max_timeout") or 0),
+    )
     if config_key == "gobuster":
         output = _retry_gobuster_wildcard(output, command, timeout)
     return output
