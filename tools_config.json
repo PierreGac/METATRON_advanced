@@ -37,7 +37,7 @@
   "gobuster": {
     "timeout": 300,
     "wordlist": "/usr/share/wordlists/dirb/common.txt",
-    "args": ["dir", "-u", "{url}", "-w", "{wordlist}"],
+    "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r"],
     "extra_args": []
   },
   "arp-scan": {

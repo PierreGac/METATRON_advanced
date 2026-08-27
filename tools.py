@@ -29,7 +29,7 @@ TOOL_INSTALL_HINTS = {
     "ffuf": "sudo apt install ffuf || go install github.com/ffuf/ffuf/v2@latest",
     "sqlmap": "git clone https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap  # apt 1.9.x is flagged outdated",
     "wapiti": "pip install -U wapiti3  # apt 3.0.x has a broken wapp database",
-    "commix": "sudo apt install commix || git clone https://github.com/commixproject/commix.git",
+    "commix": "git clone https://github.com/commixproject/commix.git /opt/commix  # apt is often stale",
     "wpscan": "sudo apt install wpscan || sudo gem install wpscan",
     "playwright": "pip install playwright && playwright install chromium",
     "testssl.sh": "sudo apt install testssl.sh",
@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "gobuster": {
         "timeout": 300,
         "wordlist": DEFAULT_WORDLIST,
-        "args": ["dir", "-u", "{url}", "-w", "{wordlist}"],
+        "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r"],
         "extra_args": [],
     },
     "arp-scan": {"timeout": 60, "args": ["--ignoredups", "{target}"], "extra_args": []},
@@ -121,7 +121,22 @@ _log_lock = threading.Lock()
 def _http_url(target: str) -> str:
     if target.startswith(("http://", "https://")):
         return target
-    return f"http://{target}"
+    return f"https://{target}"
+
+
+def _scheme_urls(target: str) -> tuple:
+    """Return (http_url, https_url) so curl can probe both schemes."""
+    raw = (target or "").strip()
+    if raw.startswith("https://"):
+        https_url = raw
+        http_url = "http://" + raw[len("https://"):]
+    elif raw.startswith("http://"):
+        http_url = raw
+        https_url = "https://" + raw[len("http://"):]
+    else:
+        http_url = f"http://{raw}"
+        https_url = f"https://{raw}"
+    return http_url, https_url
 
 
 def load_tools_config(force: bool = False) -> dict:
@@ -181,9 +196,10 @@ def resolve_wordlist(cfg: dict) -> str:
     return configured
 
 
-def substitute_args(args: list, target: str, cfg: dict) -> list:
+def substitute_args(args: list, target: str, cfg: dict, wordlist: str = None) -> list:
     url = _http_url(target)
-    wordlist = resolve_wordlist(cfg)
+    if wordlist is None:
+        wordlist = resolve_wordlist(cfg)
     crawl = str(cfg.get("crawl", 1))
     depth = str(cfg.get("depth", 2))
     mapping = {
@@ -204,9 +220,11 @@ def substitute_args(args: list, target: str, cfg: dict) -> list:
 
 def build_command(binary: str, target: str, cfg: dict) -> list:
     """Build argv. Binary (argv[0]) is never taken from JSON args/extra_args."""
-    args = substitute_args(list(cfg.get("args") or []), target, cfg)
-    extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg)
-    return [binary] + args + extra
+    wordlist = resolve_wordlist(cfg)
+    args = substitute_args(list(cfg.get("args") or []), target, cfg, wordlist=wordlist)
+    extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg, wordlist=wordlist)
+    prefix = [sys.executable, binary] if str(binary).endswith(".py") else [binary]
+    return prefix + args + extra
 
 
 def _help_blob(binary: str) -> str:
@@ -255,6 +273,7 @@ def resolve_tool_binary(logical_name: str) -> str:
     Map a config/allowlist name to an executable on PATH.
     httpx: prefer httpx-toolkit / Go install over the Python httpx CLI.
     sqlmap: prefer GitHub /opt/sqlmap or venv over outdated apt.
+    commix: prefer GitHub /opt/commix over outdated apt.
     wapiti: prefer venv wapiti3 over apt 3.0.x.
     zaproxy: also try zap.sh / owasp-zap.
     Optional tools_config.json field "binary" overrides.
@@ -286,6 +305,15 @@ def resolve_tool_binary(logical_name: str) -> str:
         if venv_sqlmap:
             return venv_sqlmap
         return shutil.which("sqlmap") or "sqlmap"
+
+    if logical_name == "commix":
+        for candidate in (Path("/usr/local/bin/commix"), Path("/opt/commix/commix.py")):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        opt_py = Path("/opt/commix/commix.py")
+        if opt_py.is_file():
+            return str(opt_py)
+        return shutil.which("commix") or "commix"
 
     if logical_name == "wapiti":
         venv_wapiti = _project_venv_bin("wapiti")
@@ -402,18 +430,31 @@ def _probe_version(binary: str) -> str:
     if binary in (sys.executable, "python", "python3"):
         _version_cache[binary] = ""
         return ""
-    for flag in ("--version", "-V"):
+    attempts = (("version",), ("--version",), ("-V",))
+    for argv in attempts:
         try:
             result = subprocess.run(
-                [binary, flag],
+                [binary, *argv],
                 capture_output=True,
                 text=True,
                 timeout=10,
                 encoding="utf-8",
                 errors="replace",
             )
+            if result.returncode != 0:
+                continue
             blob = (result.stdout or "") + (result.stderr or "")
-            lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
+            lower = blob.lower()
+            if "unknown flag" in lower or "unknown option" in lower:
+                continue
+            lines = []
+            for ln in blob.splitlines():
+                text = ln.strip()
+                if not text:
+                    continue
+                if text.lower().startswith("error:"):
+                    continue
+                lines.append(text)
             if lines:
                 summary = " | ".join(lines[:3])
                 _version_cache[binary] = summary
@@ -562,13 +603,48 @@ def run_tool(
     return _truncate_log(body, max_lines)
 
 
+GOBUSTER_WILDCARD_RE = re.compile(
+    r"exclude the status code or the length",
+    re.IGNORECASE,
+)
+GOBUSTER_LENGTH_RE = re.compile(r"\(Length:\s*(\d+)\)", re.IGNORECASE)
+
+
+def _finalize_command(logical_name: str, command: list, target: str) -> list:
+    command = list(command)
+    if logical_name == "commix":
+        url = _http_url(target)
+        if url.startswith("https://") and "--force-ssl" not in command:
+            command.append("--force-ssl")
+    return command
+
+
+def _retry_gobuster_wildcard(output: str, command: list, timeout: int) -> str:
+    if not GOBUSTER_WILDCARD_RE.search(output or ""):
+        return output
+    if "--exclude-length" in command:
+        return output
+    match = GOBUSTER_LENGTH_RE.search(output or "")
+    if not match:
+        return output
+    length = match.group(1)
+    retry_cmd = list(command) + ["--exclude-length", length]
+    print(f"  [*] gobuster wildcard length {length} — retrying with --exclude-length {length}")
+    print(f"  [*] {' '.join(str(c) for c in retry_cmd)}")
+    retry_out = run_tool(retry_cmd, timeout=timeout, tool_name="gobuster", allow_retry=False)
+    return (output or "") + f"\n\n[retry --exclude-length {length}]\n" + retry_out
+
+
 def _run_configured(binary: str, target: str, allow_retry: bool = True) -> str:
     cfg = get_tool_config(binary)
     timeout = int(cfg.get("timeout", 120) or 120)
     argv0 = resolve_tool_binary(binary)
-    command = build_command(argv0, target, cfg)
-    print(f"  [*] {' '.join(command)}")
-    return run_tool(command, timeout=timeout, tool_name=binary, allow_retry=allow_retry)
+    command = _finalize_command(binary, build_command(argv0, target, cfg), target)
+    print(f"  [*] {' '.join(str(c) for c in command)}")
+    output = run_tool(command, timeout=timeout, tool_name=binary, allow_retry=allow_retry)
+    if binary == "gobuster":
+        output = _retry_gobuster_wildcard(output, command, timeout)
+    return output
 
 
 # ─────────────────────────────────────────────
@@ -591,10 +667,15 @@ def run_curl_headers(target: str) -> str:
     """Fetch HTTP and HTTPS headers using configured curl flags."""
     cfg = get_tool_config("curl")
     timeout = int(cfg.get("timeout", 20) or 20)
-    base_args = substitute_args(list(cfg.get("args") or ["-I", "--max-time", "10", "--location"]), target, cfg)
-    extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg)
-    http_url = _http_url(target)
-    https_url = http_url.replace("http://", "https://", 1) if http_url.startswith("http://") else http_url
+    wordlist = resolve_wordlist(cfg)
+    base_args = substitute_args(
+        list(cfg.get("args") or ["-I", "--max-time", "10", "--location"]),
+        target,
+        cfg,
+        wordlist=wordlist,
+    )
+    extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg, wordlist=wordlist)
+    http_url, https_url = _scheme_urls(target)
 
     print(f"  [*] curl {' '.join(base_args + extra)} {http_url}")
     http_out = run_tool(
@@ -617,8 +698,9 @@ def run_curl_headers(target: str) -> str:
 def run_dig(target: str) -> str:
     cfg = get_tool_config("dig")
     timeout = int(cfg.get("timeout", 15) or 15)
-    extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg)
-    prefix = substitute_args(list(cfg.get("args") or ["+short"]), target, cfg)
+    wordlist = resolve_wordlist(cfg)
+    extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg, wordlist=wordlist)
+    prefix = substitute_args(list(cfg.get("args") or ["+short"]), target, cfg, wordlist=wordlist)
     print(f"  [*] dig {target} A/MX/NS/TXT")
     records = {}
     for rtype in ("A", "MX", "NS", "TXT"):
@@ -994,12 +1076,15 @@ def run_tool_by_command(command_str: str) -> str:
     cfg = get_tool_config(config_key)
     timeout = int(cfg.get("timeout", 120) or 120)
     argv0 = resolve_tool_binary(config_key)
-    command = build_command(argv0, target, cfg)
-    joined = " ".join(command)
+    command = _finalize_command(config_key, build_command(argv0, target, cfg), target)
+    joined = " ".join(str(c) for c in command)
     if target not in joined and _http_url(target) not in joined:
         command.append(target)
-    print(f"  [*] {' '.join(command)}")
-    return run_tool(command, timeout=timeout, tool_name=config_key, allow_retry=False)
+    print(f"  [*] {' '.join(str(c) for c in command)}")
+    output = run_tool(command, timeout=timeout, tool_name=config_key, allow_retry=False)
+    if config_key == "gobuster":
+        output = _retry_gobuster_wildcard(output, command, timeout)
+    return output
 
 
 # ─────────────────────────────────────────────
