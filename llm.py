@@ -7,12 +7,12 @@ Model: metatron-qwen (fine-tuned from huihui_ai/qwen3.5-abliterated:9b)
 """
 
 import re
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
 from search import handle_search_dispatch
-from tools import _http_url, run_tool_by_command
+from tools import _extract_dispatch_target, _http_url, run_tool_by_command
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "metatron-qwen"
@@ -28,6 +28,10 @@ WEB_OPTIONAL = ("wapiti", "zaproxy")
 SCANNER_ORDER = (
     "katana", "gobuster", "nuclei", "playwright", "zaproxy", "wapiti", "wpscan",
 )
+DISCOVERY_ORDER = ("katana", "gobuster", "nuclei", "playwright")
+OPTIONAL_SCANNERS = ("zaproxy", "wapiti", "wpscan")
+INJECTION_TOOLS = ("sqlmap", "dalfox", "commix")
+MAX_TOOLS_PER_ROUND = 2
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+", re.IGNORECASE)
@@ -42,6 +46,18 @@ STATIC_EXT_RE = re.compile(
 )
 OUTPUT_HEADER_RE = re.compile(r"\[\s*([A-Z0-9._-]+)\s+OUTPUT\s*\]")
 RUNNING_RE = re.compile(r"\[\*\]\s+Running\s+(\S+)", re.IGNORECASE)
+GOBUSTER_PATH_RE = re.compile(
+    r"^\s*(/[^\s]*?)\s+\(Status:\s*\d+",
+    re.IGNORECASE | re.MULTILINE,
+)
+FFUF_STATUS_PATH_RE = re.compile(
+    r"\[Status:\s*\d+[^\]]*\]\s+(/\S+)",
+    re.IGNORECASE,
+)
+BARE_PATH_RE = re.compile(r"^(/[A-Za-z0-9._~/-]+)$", re.MULTILINE)
+FS_PATH_PREFIXES = (
+    "/usr/", "/home/", "/opt/", "/etc/", "/var/", "/tmp/", "/proc/", "/root/",
+)
 
 MAX_DISCOVERED_URLS = 40
 MAX_EVIDENCE_CHARS = 12000
@@ -230,20 +246,70 @@ def _is_static_asset(url: str) -> bool:
     return bool(STATIC_EXT_RE.search(path))
 
 
-def harvest_urls(text: str, host: str, cap: int = MAX_DISCOVERED_URLS) -> list:
+def _url_has_query(url: str) -> bool:
+    parsed = _parse_url(url)
+    return bool(parsed and parsed.query)
+
+
+def _canonical_scan_url(url: str) -> str:
+    parsed = _parse_url(url)
+    if parsed is None:
+        return _strip_url(url)
+    return parsed._replace(fragment="").geturl()
+
+
+def _looks_like_fs_path(path: str) -> bool:
+    lower = (path or "").lower()
+    return any(lower.startswith(p) for p in FS_PATH_PREFIXES)
+
+
+def _join_origin_path(origin: str, path: str) -> str:
+    if not origin or not path or path.startswith("//"):
+        return ""
+    if _looks_like_fs_path(path):
+        return ""
+    base = origin if origin.endswith("/") else origin + "/"
+    return urljoin(base, path)
+
+
+def _add_harvested(url: str, host: str, seen: set, found: list, cap: int) -> bool:
+    parsed = _parse_url(url)
+    if parsed is None or _is_truncated_bracket_url(url, parsed):
+        return False
+    if url in seen or not _same_host(url, host):
+        return False
+    if _is_static_asset(url):
+        return False
+    seen.add(url)
+    found.append(url)
+    return len(found) >= cap
+
+
+def harvest_urls(text: str, host: str, cap: int = MAX_DISCOVERED_URLS, origin: str = "") -> list:
     found = []
     seen = set()
-    for raw in URL_RE.findall(text or ""):
+    blob = text or ""
+    base = origin or (_http_url(host) if host else "")
+
+    for raw in URL_RE.findall(blob):
         url = _strip_url(raw)
-        parsed = _parse_url(url)
-        if parsed is None or _is_truncated_bracket_url(url, parsed):
-            continue
-        if url in seen or not _same_host(url, host):
-            continue
-        seen.add(url)
-        found.append(url)
-        if len(found) >= cap:
-            break
+        if _add_harvested(url, host, seen, found, cap):
+            return found
+
+    if base:
+        paths = []
+        for match in GOBUSTER_PATH_RE.finditer(blob):
+            paths.append(match.group(1))
+        for match in FFUF_STATUS_PATH_RE.finditer(blob):
+            paths.append(match.group(1).rstrip(",;"))
+        for match in BARE_PATH_RE.finditer(blob):
+            paths.append(match.group(1))
+        for path in paths:
+            url = _join_origin_path(base, path)
+            if not url:
+                continue
+            if _add_harvested(url, host, seen, found, cap):
+                return found
     return found
 
 
@@ -343,7 +409,7 @@ def summarize_tool_output(raw_output: str, session_host: str = "") -> str:
         return ""
 
     facts = _nuclei_facts(text) + _zap_facts(text)
-    urls = harvest_urls(text, session_host) if session_host else []
+    urls = harvest_urls(text, session_host, origin=_http_url(session_host)) if session_host else []
 
     if len(text) < SHORT_OUTPUT and "<alertitem>" not in text.lower():
         body = text
@@ -406,7 +472,14 @@ def preferred_origin(target: str, recon: str) -> str:
     return _http_url(target)
 
 
-def missing_web_tools(ran: set, is_http: bool, is_wp: bool) -> list:
+def missing_web_tools(
+    ran: set,
+    is_http: bool,
+    is_wp: bool,
+    discovered: list = None,
+    ran_injection_urls: dict = None,
+    retargeted: set = None,
+) -> list:
     if not is_http:
         return []
     needed = list(WEB_MANDATORY)
@@ -415,9 +488,32 @@ def missing_web_tools(ran: set, is_http: bool, is_wp: bool) -> list:
         needed.append("wpscan")
     missing = []
     for name in needed:
+        if name in INJECTION_TOOLS:
+            if not injection_covered(name, ran, discovered, ran_injection_urls, retargeted):
+                missing.append(name)
+            continue
         if name not in ran and name not in missing:
             missing.append(name)
     return missing
+
+
+def injection_covered(
+    name: str,
+    ran: set,
+    discovered: list,
+    ran_injection_urls: dict,
+    retargeted: set,
+) -> bool:
+    if name not in ran:
+        return False
+    urls = (ran_injection_urls or {}).get(name, set())
+    if any(_url_has_query(u) for u in urls):
+        return True
+    if not any(_url_has_query(u) for u in (discovered or [])):
+        return True
+    if name in (retargeted or set()):
+        return True
+    return False
 
 
 def pending_curl_urls(cve_urls: dict, curled_urls: set) -> list:
@@ -437,7 +533,13 @@ def build_auto_dispatch(
     discovered: list,
     origin: str,
     curled_urls: set,
+    ran_tools: set = None,
+    ran_injection_urls: dict = None,
+    retargeted: set = None,
 ) -> list:
+    ran_tools = ran_tools or set()
+    ran_injection_urls = ran_injection_urls or {}
+    retargeted = retargeted if retargeted is not None else set()
     calls = []
     for cve in unverified_cves[:3]:
         calls.append(("SEARCH", cve))
@@ -453,17 +555,30 @@ def build_auto_dispatch(
         return calls
 
     picked = []
-    for name in SCANNER_ORDER:
+    for name in DISCOVERY_ORDER:
         if name in missing:
             picked.append(("TOOL", f"{name} {origin}"))
-            if len(picked) >= 2:
+            if len(picked) >= MAX_TOOLS_PER_ROUND:
                 return picked
 
     inj = injection_target(origin, discovered)
-    for name in ("sqlmap", "dalfox", "commix"):
+    for name in INJECTION_TOOLS:
+        if name not in missing:
+            continue
+        canon = _canonical_scan_url(inj)
+        already = ran_injection_urls.get(name, set())
+        if canon and canon in already:
+            continue
+        if name in ran_tools:
+            retargeted.add(name)
+        picked.append(("TOOL", f"{name} {inj}"))
+        if len(picked) >= MAX_TOOLS_PER_ROUND:
+            return picked
+
+    for name in OPTIONAL_SCANNERS:
         if name in missing:
-            picked.append(("TOOL", f"{name} {inj}"))
-            if len(picked) >= 2:
+            picked.append(("TOOL", f"{name} {origin}"))
+            if len(picked) >= MAX_TOOLS_PER_ROUND:
                 break
     return picked
 
@@ -519,7 +634,64 @@ def extract_tool_calls(response: str) -> list:
     return calls
 
 
-def record_calls(calls: list, ran_tools: set, searched_cves: set, curled_urls: set) -> None:
+def _call_key(call: tuple) -> tuple:
+    call_type, content = call
+    if call_type == "SEARCH":
+        return ("SEARCH", (content or "").strip().upper())
+    parts = (content or "").split()
+    tool = _canonical_tool(parts[0]) if parts else ""
+    target = _extract_dispatch_target(parts) if parts else ""
+    return ("TOOL", tool, target)
+
+
+def merge_calls(model_calls: list, auto_calls: list, max_tools: int = MAX_TOOLS_PER_ROUND) -> list:
+    """Keep model tags, then fill remaining gaps. SEARCH first; cap TOOL count."""
+    model_calls = list(model_calls or [])
+    auto_calls = list(auto_calls or [])
+    merged = []
+    seen = set()
+
+    def _add(call, count_tool: bool, skip_dup_tool: bool = False) -> bool:
+        key = _call_key(call)
+        if key in seen:
+            return False
+        if call[0] == "TOOL" and count_tool:
+            if sum(1 for t, _ in merged if t == "TOOL") >= max_tools:
+                return False
+            tool = key[1]
+            if skip_dup_tool and any(
+                _canonical_tool((c.split() or [""])[0]) == tool
+                for t, c in merged
+                if t == "TOOL"
+            ):
+                return False
+        seen.add(key)
+        merged.append(call)
+        return True
+
+    for call in model_calls:
+        if call[0] == "SEARCH":
+            _add(call, count_tool=False)
+    for call in auto_calls:
+        if call[0] == "SEARCH":
+            _add(call, count_tool=False)
+    for call in model_calls:
+        if call[0] == "TOOL":
+            _add(call, count_tool=True, skip_dup_tool=False)
+    for call in auto_calls:
+        if call[0] != "TOOL":
+            continue
+        _add(call, count_tool=True, skip_dup_tool=True)
+    return merged
+
+
+def record_calls(
+    calls: list,
+    ran_tools: set,
+    searched_cves: set,
+    curled_urls: set,
+    ran_injection_urls: dict = None,
+) -> None:
     for call_type, content in calls:
         if call_type == "SEARCH":
             for cve in extract_cves(content):
@@ -530,11 +702,13 @@ def record_calls(calls: list, ran_tools: set, searched_cves: set, curled_urls: s
         parts = content.split()
         if not parts:
             continue
-        ran_tools.add(_canonical_tool(parts[0]))
-        if _canonical_tool(parts[0]) == "curl":
-            for token in parts[1:]:
-                if token.startswith("http://") or token.startswith("https://"):
-                    curled_urls.add(_strip_url(token))
+        tool = _canonical_tool(parts[0])
+        ran_tools.add(tool)
+        target = _extract_dispatch_target(parts)
+        if tool == "curl" and target:
+            curled_urls.add(_strip_url(target))
+        if tool in INJECTION_TOOLS and target and ran_injection_urls is not None:
+            ran_injection_urls.setdefault(tool, set()).add(_canonical_scan_url(target))
 
 
 def run_tool_calls(calls: list, session_host: str = "") -> str:
@@ -713,7 +887,9 @@ def analyse_target(target: str, raw_scan: str) -> dict:
     ran_tools = tools_from_text(raw_scan)
     searched_cves = set()
     curled_urls = set()
-    discovered = harvest_urls(raw_scan, host)
+    ran_injection_urls = {}
+    retargeted = set()
+    discovered = harvest_urls(raw_scan, host, origin=origin)
     all_cves = extract_cves(raw_scan)
     cve_urls = harvest_cve_urls(raw_scan, host)
     evidence_chunks = []
@@ -734,7 +910,9 @@ def analyse_target(target: str, raw_scan: str) -> dict:
     ]
 
     for loop in range(MAX_TOOL_LOOPS):
-        missing = missing_web_tools(ran_tools, is_http, is_wp)
+        missing = missing_web_tools(
+            ran_tools, is_http, is_wp, discovered, ran_injection_urls, retargeted,
+        )
         unverified = [c for c in all_cves if c not in searched_cves]
         curl_pending = pending_curl_urls(cve_urls, curled_urls)
         loops_left = MAX_TOOL_LOOPS - loop
@@ -746,33 +924,36 @@ def analyse_target(target: str, raw_scan: str) -> dict:
         print(response)
         transcript.append(response)
 
-        calls = extract_tool_calls(response)
-        auto = False
+        model_calls = extract_tool_calls(response)
+        auto_calls = []
+        if missing or unverified or curl_pending:
+            auto_calls = build_auto_dispatch(
+                missing, unverified, cve_urls, discovered, origin, curled_urls,
+                ran_tools, ran_injection_urls, retargeted,
+            )
+        calls = merge_calls(model_calls, auto_calls)
+        auto = bool(auto_calls) and any(c not in model_calls for c in calls)
+        if auto and auto_calls:
+            print(f"\n[*] Auto-dispatch fill ({len(auto_calls)} candidates): "
+                  + ", ".join(f"{t} {c}" for t, c in auto_calls[:6]))
         if not calls:
-            if missing or unverified or curl_pending:
-                calls = build_auto_dispatch(
-                    missing, unverified, cve_urls, discovered, origin, curled_urls,
-                )
-                auto = bool(calls)
-                if auto:
-                    print(f"\n[*] Auto-dispatch ({len(calls)}): "
-                          + ", ".join(f"{t} {c}" for t, c in calls))
-            if not calls:
-                print("\n[*] Checklist complete or no further tools. Moving to finalize.")
-                break
+            print("\n[*] Checklist complete or no further tools. Moving to finalize.")
+            break
 
-        record_calls(calls, ran_tools, searched_cves, curled_urls)
+        record_calls(calls, ran_tools, searched_cves, curled_urls, ran_injection_urls)
         tool_results = run_tool_calls(calls, session_host=host)
         evidence_chunks.append(tool_results)
 
         all_cves = list(dict.fromkeys(all_cves + extract_cves(tool_results)))
         cve_urls.update(harvest_cve_urls(tool_results, host))
-        for url in harvest_urls(tool_results, host):
+        for url in harvest_urls(tool_results, host, origin=origin):
             if url not in discovered:
                 discovered.append(url)
 
         messages.append({"role": "assistant", "content": response})
-        missing = missing_web_tools(ran_tools, is_http, is_wp)
+        missing = missing_web_tools(
+            ran_tools, is_http, is_wp, discovered, ran_injection_urls, retargeted,
+        )
         unverified = [c for c in all_cves if c not in searched_cves]
         curl_pending = pending_curl_urls(cve_urls, curled_urls)
         nudge = checklist_message(

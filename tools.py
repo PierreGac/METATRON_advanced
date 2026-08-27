@@ -16,6 +16,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qsl, urlparse
 
 
 CONFIG_PATH = Path(__file__).parent / "tools_config.json"
@@ -58,7 +59,7 @@ DEFAULT_CONFIG = {
     "gobuster": {
         "timeout": 300,
         "wordlist": DEFAULT_WORDLIST,
-        "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r"],
+        "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r", "-e"],
         "extra_args": [],
     },
     "arp-scan": {"timeout": 60, "args": ["--ignoredups", "{target}"], "extra_args": []},
@@ -200,7 +201,11 @@ def substitute_args(args: list, target: str, cfg: dict, wordlist: str = None) ->
     url = _http_url(target)
     if wordlist is None:
         wordlist = resolve_wordlist(cfg)
-    crawl = str(cfg.get("crawl", 1))
+    try:
+        crawl_n = int(cfg.get("crawl", 1) or 1)
+    except (TypeError, ValueError):
+        crawl_n = 1
+    crawl = str(max(1, min(3, crawl_n)))
     depth = str(cfg.get("depth", 2))
     mapping = {
         "{target}": target,
@@ -616,6 +621,18 @@ def _finalize_command(logical_name: str, command: list, target: str) -> list:
         url = _http_url(target)
         if url.startswith("https://") and "--force-ssl" not in command:
             command.append("--force-ssl")
+    if logical_name == "sqlmap":
+        raw = target if target.startswith(("http://", "https://")) else _http_url(target)
+        parsed = urlparse(raw)
+        keys = []
+        for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+            if key and key not in keys:
+                keys.append(key)
+        if keys:
+            if "-p" not in command:
+                command.extend(["-p", ",".join(keys)])
+        elif "--forms" not in command:
+            command.append("--forms")
     return command
 
 

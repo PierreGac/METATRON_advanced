@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
 METATRON - browser_probe.py
-Origin-locked Playwright click probe. Opens a URL, clicks a capped set of
-same-host links/buttons, and reports console errors, failed requests, and crashes.
-Does not submit login/payment forms or inject payloads.
+Origin-locked Playwright click probe. Opens a URL, inventories same-origin
+forms, submits safe GET forms with a canary, clicks a capped set of same-host
+links/buttons, and reports console errors, failed requests, and crashes.
+Does not submit login/payment forms or inject attack payloads.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 
 BLOCKED_SCHEMES = {"javascript", "data", "file", "blob", "about"}
+CANARY = "metatron_probe"
 
 CONSENT_LABELS = (
     "nécessaires",
@@ -131,6 +133,110 @@ def dismiss_cookie_banner(page, timeout_ms: int) -> bool:
     return False
 
 
+def collect_forms(page, page_url: str) -> list:
+    """Return same-document forms: method, action URL, fields, skip flags."""
+    try:
+        raw = page.evaluate(
+            """() => Array.from(document.forms).map(f => {
+                const inputs = Array.from(f.elements).filter(e => {
+                    const name = e.name || e.getAttribute('name');
+                    const type = (e.type || '').toLowerCase();
+                    return !!name && !['submit', 'button', 'image', 'reset'].includes(type);
+                });
+                const fields = inputs.map(e => e.name || e.getAttribute('name'));
+                const types = inputs.map(e => (e.type || '').toLowerCase());
+                const hasPass = types.includes('password');
+                const hasEmail = types.includes('email') || fields.some(n =>
+                    /e-?mail/i.test(n || ''));
+                const text = ((f.innerText || '') + ' ' + (f.getAttribute('id') || '')
+                    + ' ' + (f.getAttribute('name') || '')).toLowerCase();
+                const payment = /card|cvv|iban|paypal|billing|credit.?card/.test(text);
+                return {
+                    method: (f.method || 'get').toUpperCase(),
+                    action: f.getAttribute('action') || '',
+                    fields,
+                    hasPass,
+                    hasEmail,
+                    payment,
+                };
+            })"""
+        )
+    except Exception as exc:
+        _print(f"[!] could not collect forms: {exc}")
+        return []
+
+    forms = []
+    for item in raw or []:
+        action = item.get("action") or ""
+        absolute = urljoin(page_url, action)
+        forms.append({
+            "method": (item.get("method") or "GET").upper(),
+            "action": absolute,
+            "fields": [f for f in (item.get("fields") or []) if f],
+            "hasPass": bool(item.get("hasPass")),
+            "hasEmail": bool(item.get("hasEmail")),
+            "payment": bool(item.get("payment")),
+        })
+    return forms
+
+
+def _print_forms(forms: list) -> None:
+    _print("=== forms ===")
+    if not forms:
+        _print("  (none)")
+        return
+    for form in forms:
+        fields = ", ".join(form["fields"]) or "(no named fields)"
+        extra = []
+        if form["hasPass"] or form["hasEmail"]:
+            extra.append("no-submit: login/email")
+        if form["payment"]:
+            extra.append("no-submit: payment")
+        suffix = f"  [{'; '.join(extra)}]" if extra else ""
+        _print(f"{form['method']} {form['action']}  fields: {fields}{suffix}")
+
+
+def _canary_get_url(action: str, fields: list) -> str:
+    parsed = urlparse(action)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for name in fields:
+        if name not in query:
+            query[name] = CANARY
+    if not query and fields:
+        query[fields[0]] = CANARY
+    return parsed._replace(query=urlencode(query)).geturl()
+
+
+def probe_safe_get_forms(page, forms: list, is_allowed, timeout_ms: int, start_url: str) -> list:
+    """Submit GET forms that are not login/payment; return landed canary URLs."""
+    landed_urls = []
+    for form in forms:
+        if form["method"] != "GET":
+            continue
+        if form["hasPass"] or form["hasEmail"] or form["payment"]:
+            continue
+        if not form["fields"]:
+            continue
+        canary_url = _canary_get_url(form["action"], form["fields"])
+        if not is_allowed(canary_url):
+            _print(f"  [skip] canary off-origin: {canary_url}")
+            continue
+        _print(f"[*] GET canary {canary_url}")
+        try:
+            page.goto(canary_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            landed = page.url
+            _print(f"  [canary] {landed}")
+            if is_allowed(landed):
+                landed_urls.append(landed)
+            try:
+                page.goto(start_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception:
+                pass
+        except Exception as exc:
+            _print(f"  [!] canary GET failed: {exc}")
+    return landed_urls
+
+
 def run_probe(args: argparse.Namespace) -> int:
     try:
         from playwright.sync_api import sync_playwright
@@ -152,6 +258,8 @@ def run_probe(args: argparse.Namespace) -> int:
     skipped = []
     clicked = []
     page_errors = []
+    forms = []
+    canary_urls = []
 
     _print(f"[*] playwright {getattr(playwright_pkg, '__version__', 'unknown')}")
     _print(f"[*] start URL: {args.url}")
@@ -235,8 +343,21 @@ def run_probe(args: argparse.Namespace) -> int:
                 skipped.append(final_url)
                 context.close()
                 browser.close()
-                _print_summary(title, final_url, clicked, skipped, console_errors, failed_requests, page_errors)
+                _print_summary(
+                    title, final_url, clicked, skipped, console_errors,
+                    failed_requests, page_errors, forms, canary_urls,
+                )
                 return 0
+
+            forms = collect_forms(page, final_url)
+            _print_forms(forms)
+            canary_urls = probe_safe_get_forms(
+                page, forms, is_allowed, args.click_timeout_ms, final_url,
+            )
+            try:
+                final_url = page.url
+            except Exception:
+                pass
 
             hrefs = []
             try:
@@ -336,15 +457,25 @@ def run_probe(args: argparse.Namespace) -> int:
         _print(f"[!] Unexpected Playwright error: {exc}")
         return 1
 
-    _print_summary(title, final_url, clicked, skipped, console_errors, failed_requests, page_errors)
+    _print_summary(
+        title, final_url, clicked, skipped, console_errors, failed_requests,
+        page_errors, forms, canary_urls,
+    )
     return 0
 
 
-def _print_summary(title, final_url, clicked, skipped, console_errors, failed_requests, page_errors):
+def _print_summary(
+    title, final_url, clicked, skipped, console_errors, failed_requests, page_errors,
+    forms=None, canary_urls=None,
+):
     _print("")
     _print("=== playwright probe summary ===")
     _print(f"title: {title}")
     _print(f"final URL: {final_url}")
+    _print_forms(forms or [])
+    _print(f"canary URLs ({len(canary_urls or [])}):")
+    for item in canary_urls or []:
+        _print(f"  - {item}")
     _print(f"clicked ({len(clicked)}):")
     for item in clicked:
         _print(f"  - {item}")
