@@ -97,7 +97,8 @@
   },
   "commix": {
     "timeout": 600,
-    "args": ["--url", "{url}", "--batch"],
+    "crawl": 2,
+    "args": ["--url", "{url}", "--batch", "--crawl={crawl}"],
     "extra_args": []
   },
   "wpscan": {
@@ -106,7 +107,9 @@
     "extra_args": []
   },
   "zaproxy": {
-    "timeout": 600,
+    "timeout": 120,
+    "idle_reset": true,
+    "max_timeout": 3600,
     "args": [
       "-cmd",
       "-quickurl",

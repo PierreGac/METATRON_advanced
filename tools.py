@@ -93,10 +93,17 @@ DEFAULT_CONFIG = {
         "extra_args": [],
     },
     "dalfox": {"timeout": 300, "args": ["url", "{url}"], "extra_args": []},
-    "commix": {"timeout": 600, "args": ["--url", "{url}", "--batch"], "extra_args": []},
+    "commix": {
+        "timeout": 600,
+        "crawl": 2,
+        "args": ["--url", "{url}", "--batch", "--crawl={crawl}"],
+        "extra_args": [],
+    },
     "wpscan": {"timeout": 300, "args": ["--url", "{url}"], "extra_args": []},
     "zaproxy": {
-        "timeout": 600,
+        "timeout": 120,
+        "idle_reset": True,
+        "max_timeout": 3600,
         "args": [
             "-cmd", "-quickurl", "{url}", "-quickprogress",
             "-config", "spider.maxChildren=10",
@@ -564,22 +571,25 @@ def run_tool(
     try:
         proc = subprocess.Popen(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            encoding="utf-8",
-            errors="replace",
+            bufsize=0,
         )
 
         def _reader():
-            if proc.stdout is None:
+            raw = proc.stdout
+            if raw is None:
                 return
-            for line in iter(proc.stdout.readline, ""):
+            while True:
+                chunk = raw.read(4096)
+                if not chunk:
+                    break
                 activity["t"] = time.monotonic()
-                print(line, end="", flush=True)
-                captured.append(line)
-                _append_log_file(name, line)
+                text = chunk.decode("utf-8", errors="replace")
+                print(text, end="", flush=True)
+                captured.append(text)
+                _append_log_file(name, text)
 
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
@@ -681,6 +691,11 @@ def _finalize_command(logical_name: str, command: list, target: str) -> list:
         url = _http_url(target)
         if url.startswith("https://") and "--force-ssl" not in command:
             command.append("--force-ssl")
+        raw = target if target.startswith(("http://", "https://")) else url
+        parsed = urlparse(raw)
+        has_query = bool(parse_qsl(parsed.query, keep_blank_values=True))
+        if not has_query and not any(str(a).startswith("--crawl") for a in command):
+            command.append("--crawl=2")
     if logical_name == "sqlmap":
         raw = target if target.startswith(("http://", "https://")) else _http_url(target)
         parsed = urlparse(raw)
