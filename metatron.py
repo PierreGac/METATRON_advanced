@@ -30,8 +30,8 @@ from db import (
     print_history,
     print_session
 )
-from tools import interactive_tool_run, format_recon_for_llm, run_default_recon
-from llm import analyse_target
+from tools import collect_install_status, interactive_tool_run, format_recon_for_llm, run_default_recon
+from llm import analyse_target, MODEL_NAME, OLLAMA_URL
 
 
 # ─────────────────────────────────────────────
@@ -390,6 +390,148 @@ def check_db():
         return False
 
 
+PYTHON_MODULES = (
+    ("mysql.connector", "mysql-connector-python"),
+    ("requests", "requests"),
+    ("bs4", "beautifulsoup4"),
+    ("ddgs", "ddgs"),
+    ("playwright", "playwright"),
+    ("reportlab", "reportlab"),
+    ("rich", "rich"),
+    ("lxml", "lxml"),
+    ("PIL", "pillow"),
+)
+
+
+def _print_check_row(ok: bool, name: str, detail: str, hint: str = "") -> None:
+    if ok:
+        extra = f"  \033[90m{detail}\033[0m" if detail else ""
+        print(f"  \033[92m[✓]\033[0m {name}{extra}")
+    else:
+        print(f"  \033[91m[✗]\033[0m {name}  \033[90m{detail}\033[0m")
+        if hint:
+            print(f"      \033[93m→ {hint}\033[0m")
+
+
+def _check_python_packages() -> tuple:
+    ok_n = miss_n = 0
+    print("\n  Python packages")
+    for module, pip_name in PYTHON_MODULES:
+        try:
+            __import__(module)
+            _print_check_row(True, pip_name, module)
+            ok_n += 1
+        except Exception as exc:
+            _print_check_row(False, pip_name, str(exc), f"pip install {pip_name}")
+            miss_n += 1
+    return ok_n, miss_n
+
+
+def _check_ollama() -> tuple:
+    print("\n  Ollama")
+    ok_n = miss_n = 0
+    try:
+        import requests
+        base = OLLAMA_URL.rsplit("/api/", 1)[0]
+        resp = requests.get(base, timeout=3)
+        alive = resp.status_code < 500
+    except Exception as exc:
+        _print_check_row(False, "ollama API", str(exc), "ollama serve")
+        _print_check_row(False, f"model {MODEL_NAME}", "API unreachable", f"ollama create {MODEL_NAME} -f Modelfile")
+        return 0, 2
+    _print_check_row(alive, "ollama API", base)
+    if alive:
+        ok_n += 1
+    else:
+        miss_n += 1
+    model_ok = False
+    detail = "not listed"
+    try:
+        import requests
+        tags = requests.get(f"{base}/api/tags", timeout=5).json()
+        names = [m.get("name", "") for m in tags.get("models", [])]
+        model_ok = any(MODEL_NAME in n for n in names)
+        if model_ok:
+            detail = next(n for n in names if MODEL_NAME in n)
+        elif names:
+            detail = "installed: " + ", ".join(names[:6])
+    except Exception as exc:
+        detail = str(exc)
+    _print_check_row(
+        model_ok,
+        f"model {MODEL_NAME}",
+        detail,
+        f"ollama create {MODEL_NAME} -f Modelfile && ollama run {MODEL_NAME}",
+    )
+    if model_ok:
+        ok_n += 1
+    else:
+        miss_n += 1
+    return ok_n, miss_n
+
+
+def _check_mariadb() -> tuple:
+    print("\n  Database")
+    try:
+        conn = get_connection()
+        conn.close()
+        _print_check_row(True, "MariaDB", "metatron@localhost")
+        return 1, 0
+    except Exception as exc:
+        _print_check_row(
+            False,
+            "MariaDB",
+            str(exc),
+            "sudo systemctl start mariadb  (user metatron / db metatron)",
+        )
+        return 0, 1
+
+
+def check_install():
+    """Verify Python deps, scanners, wordlist, MariaDB, Ollama, Playwright."""
+    divider("INSTALLATION CHECK")
+    info("Checking requirements, tools, and services...")
+    ok_n = miss_n = 0
+
+    p_ok, p_miss = _check_python_packages()
+    ok_n += p_ok
+    miss_n += p_miss
+
+    print("\n  Scan tools")
+    rows = collect_install_status()
+    for row in rows:
+        if row["group"] == "tools":
+            _print_check_row(row["ok"], row["name"], row["detail"], row["hint"])
+            if row["ok"]:
+                ok_n += 1
+            else:
+                miss_n += 1
+
+    print("\n  Wordlists & runtime")
+    for row in rows:
+        if row["group"] in ("wordlist", "runtime"):
+            _print_check_row(row["ok"], row["name"], row["detail"], row["hint"])
+            if row["ok"]:
+                ok_n += 1
+            else:
+                miss_n += 1
+
+    d_ok, d_miss = _check_mariadb()
+    ok_n += d_ok
+    miss_n += d_miss
+
+    o_ok, o_miss = _check_ollama()
+    ok_n += o_ok
+    miss_n += o_miss
+
+    divider()
+    if miss_n == 0:
+        success(f"All {ok_n} checks passed.")
+    else:
+        warn(f"{ok_n} ok, {miss_n} missing. Install hints are listed above.")
+        info("On Debian/Ubuntu, sudo ./install.sh covers most of these.")
+
+
 # ─────────────────────────────────────────────
 # MAIN MENU
 # ─────────────────────────────────────────────
@@ -399,7 +541,8 @@ def main_menu():
         banner()
         print("  \033[92m[1]\033[0m  New Scan")
         print("  \033[92m[2]\033[0m  View History")
-        print("  \033[92m[3]\033[0m  Exit")
+        print("  \033[92m[3]\033[0m  Check installation")
+        print("  \033[92m[4]\033[0m  Exit")
         divider()
 
         choice = prompt("metatron> ")
@@ -413,6 +556,10 @@ def main_menu():
             input("\n\033[90mPress Enter to continue...\033[0m")
 
         elif choice == "3":
+            check_install()
+            input("\n\033[90mPress Enter to continue...\033[0m")
+
+        elif choice == "4":
             print("\n\033[91m[*] Shutting down Metatron. Stay legal.\033[0m\n")
             sys.exit(0)
 

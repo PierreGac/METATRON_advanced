@@ -21,14 +21,16 @@ AI-powered penetration testing assistant using local LLM on linux (Parrot OS)
 
 **Metatron** is a CLI-based AI penetration testing assistant that runs entirely on your local machine — no cloud, no API keys, no subscriptions.
 
-You give it a target IP or domain. It runs real recon tools (nmap, whois, whatweb, curl, dig, nikto), feeds all results to a locally running AI model, and the AI analyzes the target, identifies vulnerabilities, suggests exploits, and recommends fixes. Everything gets saved to a MariaDB database with full scan history.
+You give it a target IP or domain. It runs recon and web-testing tools (nmap, whois, whatweb, curl, dig, nikto, gobuster, sslscan, nuclei, sqlmap, and more), feeds results to a locally running AI model, and the AI analyzes the target, identifies vulnerabilities, suggests exploits, and recommends fixes. Everything gets saved to a MariaDB database with full scan history. Full tool logs are also written under `scan_results/`.
 
 ---
 
 ## ✨ Features
 
 - 🤖 **Local AI Analysis** — powered by `metatron-qwen` via Ollama, runs 100% offline
-- 🔍 **Automated Recon** — nmap, whois, whatweb, curl headers, dig DNS, nikto
+- 🔍 **Automated Recon** — nmap, whois, whatweb, curl headers, dig DNS, plus optional web testers
+- 🛠️ **Configurable tools** — `tools_config.json` for timeouts, flags, wordlists, crawl depth, ZAP limits, Playwright clicks
+- 📁 **Scan logs** — full live output saved under `scan_results/<target>/<timestamp>/`
 - 🌐 **Web Search** — DuckDuckGo search + CVE lookup (no API key needed)
 - 🗄️ **MariaDB Backend** — full scan history with 5 linked tables
 - ✏️ **Edit / Delete** — modify any saved result directly from the CLI
@@ -82,6 +84,21 @@ Metatron allows you to export scan results into clean, shareable report formats 
 
 ## ⚙️ Installation
 
+### Quick install (recommended)
+
+On Parrot, Kali, or Debian, from the repo root:
+
+```bash
+chmod +x install.sh
+sudo ./install.sh
+```
+
+The script installs apt packages as root, then Python venv, Playwright Chromium, Go scanners, Ollama, and (optional) the MariaDB schema as your normal user. Missing apt names are skipped and filled with Go/pip/gem fallbacks.
+
+Manual steps below are only needed if you prefer not to use `install.sh`.
+
+---
+
 ### 1. Clone the repository
 
 ```bash
@@ -102,11 +119,102 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Install system tools
+`pip` installs the Playwright **Python package only**. It does not download Chromium. Do the next step or menu `[21] playwright` will fail with `Executable doesn't exist` / `ms-playwright/chromium_headless_shell-...`.
+
+### 4. Install Playwright browsers (required for `[21] playwright`)
+
+Stay inside the same venv as step 2, then download Chromium (and OS libraries on Linux):
 
 ```bash
-sudo apt install nmap whois whatweb curl dnsutils nikto
+playwright install chromium
+sudo playwright install-deps chromium
 ```
+
+If Playwright was just upgraded and asks you to download browsers, run:
+
+```bash
+playwright install
+```
+
+That installs every bundled browser. `playwright install chromium` is enough for Metatron.
+
+Confirm the binary exists:
+
+```bash
+python3 -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True); print(b.version); b.close(); p.stop()"
+```
+
+Notes:
+
+- Use the **venv** `playwright` command (`which playwright` should point at `venv/bin/playwright`). A system-wide install puts browsers in a different cache than the venv package.
+- Browsers land under `~/.cache/ms-playwright/`. If that path is missing after install, the venv and the `playwright` CLI are not the same install.
+- On Parrot/Debian, `install-deps` pulls libraries Chromium needs (missing libs look like a launch failure even after `playwright install chromium`).
+
+### 5. Install system tools
+
+Metatron calls host binaries by name. Packages below are typical on **Kali**; **Parrot** may omit some — install the fallback if `apt` says “Unable to locate package”.
+
+**Core recon**
+
+```bash
+sudo apt update
+sudo apt install nmap whois whatweb curl dnsutils nikto gobuster arp-scan sslscan
+```
+
+**Web testers (apt — skip any name your distro does not ship)**
+
+```bash
+sudo apt install sqlmap wapiti ffuf commix wpscan testssl.sh
+sudo apt install zaproxy
+sudo apt install httpx-toolkit
+```
+
+Debian/Ubuntu `sqlmap` and `wapiti` apt packages are often stale (sqlmap "version is outdated", Wapiti 3.0.x "Problem with local wapp database"). Prefer the GitHub sqlmap clone and `pip install -U wapiti3` from the table below; `install.sh` does that automatically.
+
+`httpx-toolkit` is ProjectDiscovery **httpx**. Do not use the Python `httpx` CLI from `requirements.txt` (`httpx [OPTIONS] URL` / no `-u`). Metatron prefers `httpx-toolkit`, then `$GOPATH/bin/httpx`, and ignores a Python `httpx` on PATH.
+
+**Go tools** (put Go’s bin directory first, then install):
+
+```bash
+export PATH="$(go env GOPATH)/bin:$PATH"
+# persist that line in ~/.bashrc or ~/.zshrc
+
+go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install -v github.com/hahwul/dalfox/v2@latest
+go install github.com/ffuf/ffuf/v2@latest
+```
+
+**If apt cannot find a package**
+
+| Tool | Fallback |
+|------|----------|
+| sqlmap | Debian/Ubuntu apt (e.g. 1.9.6) is flagged outdated. `git clone https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap` and wrap `/usr/local/bin/sqlmap` (install.sh does this) |
+| wapiti | apt 3.0.x prints `Problem with local wapp database`. `pip install -U wapiti3` in the venv (CLI is still `wapiti`) |
+| ffuf | `go install github.com/ffuf/ffuf/v2@latest` |
+| dalfox | Go install above |
+| commix | `git clone https://github.com/commixproject/commix.git` then `sudo ln -s "$PWD/commix/commix.py" /usr/local/bin/commix` |
+| wpscan | `sudo gem install wpscan` (needs Ruby) |
+| zaproxy | `sudo apt install zaproxy` or install OWASP ZAP; binary may be `zap.sh` under `/usr/share/zaproxy/` (Metatron also looks for `zap.sh` / `owasp-zap`) |
+| nuclei / katana / httpx | Go install + PATH as above |
+| testssl.sh | `sudo apt install testssl.sh` or clone https://github.com/drwetter/testssl.sh |
+
+Wordlists for gobuster/ffuf:
+
+```bash
+sudo apt install dirb
+# expects /usr/share/wordlists/dirb/common.txt on Kali; Ubuntu dirb uses
+# /usr/share/dirb/wordlists/common.txt (Metatron falls back automatically)
+```
+
+Check what is actually on PATH:
+
+```bash
+command -v nmap gobuster sqlmap ffuf dalfox nuclei katana httpx-toolkit wapiti commix wpscan zaproxy
+```
+
+If you already ran `pip install -r requirements.txt` but skipped browsers, run step 4 now — you do not need to reinstall Python packages.
 
 ---
 
@@ -264,7 +372,8 @@ python metatron.py
 ```
   [1]  New Scan
   [2]  View History
-  [3]  Exit
+  [3]  Check installation
+  [4]  Exit
 ```
 
 **2. Select [1] New Scan → enter your target:**
@@ -284,15 +393,55 @@ or
   [4] curl headers
   [5] dig DNS
   [6] nikto
-  [a] Run all (except nikto)
-  [n] Run all + nikto (slow)
+  [7] gobuster
+  [8] arp-scan
+  [9] sslscan
+  [10] testssl.sh
+  [11] katana
+  [12] nuclei
+  [13] httpx
+  [14] ffuf
+  [15] sqlmap
+  [16] wapiti
+  [17] dalfox
+  [18] commix
+  [19] wpscan
+  [20] zaproxy
+  [21] playwright
+  [a] Legacy: nmap, whois, whatweb, curl, dig
+  [n] Legacy: same as [a] plus nikto
+  [m] Run all tools
 ```
 
-**4. Metatron runs the tools, feeds results to the AI, and prints the analysis.**
+**4. Review or edit configuration** for the selected tools (`tools_config.json`). Each tool is shown in its own `=== name ===` block. Press Enter to run, or `e` to edit the JSON in `$EDITOR` (nano by default).
 
-**5. Everything is saved to MariaDB automatically.**
+**5. Metatron streams tool output live.** If a tool times out you can retry with a higher timeout (`y`), edit config (`e`), or keep the partial log (`N`). Full logs (not truncated) go to `scan_results/<target>/<timestamp>/<tool>.log`. The copy sent to the AI is capped by `_global.max_log_lines` (default 2000).
 
-**6. After the scan you can edit or delete any result.**
+**6. Results are fed to the AI.** The model emits `[TOOL:]` / `[SEARCH:]` tags (TARGET only; flags come from JSON). Missing scanners and unverified CVEs are auto-dispatched. A final schema-only pass writes `VULN:` / `RISK_LEVEL:` for the database.
+
+**7. Everything is saved to MariaDB automatically.**
+
+**8. After the scan you can edit or delete any result.**
+
+---
+
+## ⚙️ Tool configuration
+
+[`tools_config.json`](tools_config.json) controls timeouts, flags, wordlists, crawl depth, ZAP spider limits, and Playwright click settings. JSON cannot change the binary name (`argv[0]`). AI `[TOOL: name TARGET]` tags use the same JSON flags — extra flags the model writes are ignored. The AI may only change **TARGET** (origin or a discovered same-host URL). The analysis loop auto-runs missing web scanners if the model forgets tags, searches unverified CVEs, then does a schema-only finalize pass; **that** finalize output is what is parsed into MariaDB.
+
+Placeholders in `args`: `{target}`, `{url}`, `{wordlist}`, `{crawl}`, `{depth}`. Gobuster/ffuf fall back to `/usr/share/dirb/wordlists/common.txt` when the Kali wordlist path is missing. Katana includes `-jc` (JS crawl) for SPAs. Playwright dismisses cookie/consent dialogs before other clicks.
+
+Append extra flags with `extra_args`. Global keys:
+
+```json
+"_global": {
+  "max_log_lines": 2000,
+  "timeout_retry_multiplier": 2,
+  "results_dir": "scan_results"
+}
+```
+
+ZAP defaults cap spider children/depth/duration so `-quickurl` does not run unbounded. Playwright stays on the start host unless you set `allowed_hosts` or `allow_subdomains`.
 
 ---
 
@@ -300,14 +449,17 @@ or
 
 ```
 METATRON/
-├── metatron.py       ← main CLI entry point
-├── db.py             ← MariaDB connection and all CRUD operations
-├── tools.py          ← recon tool runners (nmap, whois, etc.)
-├── llm.py            ← Ollama interface and AI tool dispatch loop
-├── search.py         ← DuckDuckGo web search and CVE lookup
-├── Modelfile         ← custom model config for metatron-qwen
-├── requirements.txt  ← Python dependencies
-├── .gitignore        ← excludes venv, pycache, db files
+├── install.sh          ← sudo full install (apt, venv, Playwright, Go tools, Ollama)
+├── metatron.py         ← main CLI entry point
+├── db.py               ← MariaDB connection and all CRUD operations
+├── tools.py            ← recon / web-test runners, live logs, config
+├── tools_config.json   ← per-tool timeouts, args, wordlists, ZAP/Playwright settings
+├── browser_probe.py    ← origin-locked Playwright click probe
+├── llm.py              ← Ollama interface and AI tool dispatch loop
+├── search.py           ← DuckDuckGo web search and CVE lookup
+├── Modelfile           ← custom model config for metatron-qwen
+├── requirements.txt    ← Python dependencies
+├── .gitignore          ← excludes venv, pycache, scan_results, db files
 ├── LICENSE           ← MIT License
 ├── README.md         ← this file
 └── screenshots/      ← terminal screenshots for documentation

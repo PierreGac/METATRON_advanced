@@ -7,78 +7,130 @@ Model: metatron-qwen (fine-tuned from huihui_ai/qwen3.5-abliterated:9b)
 """
 
 import re
-import requests
-import json
-from tools import run_tool_by_command, run_nmap, run_curl_headers
-from search import handle_search_dispatch
+from urllib.parse import urlparse
 
-OLLAMA_URL  = "http://localhost:11434/api/chat"
-MODEL_NAME  = "metatron-qwen"
+import requests
+
+from search import handle_search_dispatch
+from tools import _http_url, run_tool_by_command
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL_NAME = "metatron-qwen"
 MAX_TOKENS = 8192
-MAX_TOOL_LOOPS = 9   # max times AI can call tools per session
-OLLAMA_TIMEOUT = 600 
+MAX_TOOL_LOOPS = 9
+OLLAMA_TIMEOUT = 600
+ANALYSIS_TEMPERATURE = 0.2
+
+WEB_MANDATORY = (
+    "nuclei", "sqlmap", "dalfox", "commix", "katana", "gobuster", "playwright",
+)
+WEB_OPTIONAL = ("wapiti", "zaproxy")
+SCANNER_ORDER = (
+    "katana", "gobuster", "nuclei", "playwright", "zaproxy", "wapiti", "wpscan",
+)
+
+CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+", re.IGNORECASE)
+NUCLEI_LINE_RE = re.compile(
+    r"^\s*\[[^\]]+\]\s*\[(?:http|dns|ssl|tcp|javascript)\]\s*"
+    r"\[(?:info|low|medium|high|critical)\]",
+    re.IGNORECASE,
+)
+STATIC_EXT_RE = re.compile(
+    r"\.(?:js|css|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|webp|mp4)(?:\?|$)",
+    re.IGNORECASE,
+)
+OUTPUT_HEADER_RE = re.compile(r"\[\s*([A-Z0-9._-]+)\s+OUTPUT\s*\]")
+RUNNING_RE = re.compile(r"\[\*\]\s+Running\s+(\S+)", re.IGNORECASE)
+
+MAX_DISCOVERED_URLS = 40
+MAX_EVIDENCE_CHARS = 12000
+SHORT_OUTPUT = 800
+TAIL_LINES = 20
 
 # ─────────────────────────────────────────────
 # SYSTEM PROMPT
 # ─────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are METATRON, an elite AI penetration testing assistant running on Parrot OS.
-You are precise, technical, and direct. No fluff.
+SYSTEM_PROMPT = """You are METATRON, a penetration testing assistant.
+Be precise and technical. No fluff. No markdown. No YAML.
 
-You have access to real tools. To use them, write tags in your response:
+You drive real tools with tags. Flags always come from tools_config.json.
 
-  [TOOL: nmap -sV 192.168.1.1]       → runs nmap or any CLI tool
-  [SEARCH: CVE-2021-44228 exploit]   → searches the web via DuckDuckGo
+  [TOOL: nuclei https://host/path]   → runs that tool against TARGET
+  [SEARCH: CVE-2026-33017]           → DuckDuckGo lookup
+
+Rules for tags:
+- Write ONLY [TOOL: <name> <TARGET>] or [SEARCH: <query>].
+- TARGET may be the session host OR any discovered same-host URL
+  (example: [TOOL: dalfox https://example.com/search?q=test]).
+- Do not invent flags (-sV, -u, --batch, -silent, YAML, nuclei templates).
+- Extra flags are ignored. To change paths, change TARGET only.
+
+Allowed tool names:
+  nmap, whois, whatweb, curl, dig, nikto, gobuster, arp-scan, sslscan, testssl.sh,
+  katana, nuclei, httpx, ffuf, sqlmap, wapiti, dalfox, commix, wpscan, zaproxy, playwright
+
+How to use them:
+- katana/gobuster first on a web target to collect paths.
+- Then retarget sqlmap, dalfox, and commix at URLs with query strings or API paths
+  from DISCOVERED_URLS. Do not keep scanning only the origin homepage.
+- nuclei/wapiti/zaproxy: origin or interesting paths.
+- curl: fetch a specific evidence URL (headers). Use this for Nuclei hit URLs.
+- [SEARCH: CVE-…] for every CVE that appears in tool output BEFORE you treat it as a finding.
+- playwright: browser clicks. Cookie banners are probe blockers, not vulnerabilities.
+
+Do not write VULN:/EXPLOIT:/RISK_LEVEL in tool rounds. A later finalize pass does that.
+
+Accuracy:
+- nmap filtered or no-response is INCONCLUSIVE, not vulnerable.
+- Never assert a version that is not in scan output.
+- Never invent CVEs. Repeat a Nuclei CVE only after SEARCH, and name the product
+  in the template (e.g. Langflow). If the app does not match, it is unconfirmed.
+- Only CRITICAL with SEARCH plus endpoint evidence of exploitability.
+- Cookie overlays and WebGL/console deprecation noise are not vulns.
+- curl HTTP_CODE=000 means unreachable, not exploitable.
+"""
+
+FINALIZE_PROMPT = """You are METATRON writing the saved pentest record.
+Output ONLY the schema below. No markdown, no backticks, no YAML, no headings, no emoji.
+
+VULN: <name> | SEVERITY: <critical|high|medium|low> | PORT: <port or blank> | SERVICE: <service>
+DESC: <one line>
+FIX: <one line>
+
+EXPLOIT: <name> | TOOL: <tool> | PAYLOAD: <payload or description>
+RESULT: <expected or observed result>
+NOTES: <notes>
+
+RISK_LEVEL: <CRITICAL|HIGH|MEDIUM|LOW>
+SUMMARY: <2-3 sentences>
 
 Rules:
-- Always analyze scan data thoroughly before suggesting exploits
-- List vulnerabilities with: name, severity (critical/high/medium/low), port, service
-- For each vulnerability, suggest a concrete fix
-- If you need more information, use [SEARCH:] or [TOOL:]
-- Format vulnerabilities clearly so they can be saved to a database
-- Be specific about CVE IDs when you know them
-- Always give a final risk rating: CRITICAL / HIGH / MEDIUM / LOW
-
-Output format for vulnerabilities (use this exactly):
-VULN: <name> | SEVERITY: <level> | PORT: <port> | SERVICE: <service>
-DESC: <description>
-FIX: <fix recommendation>
-
-Output format for exploits:
-EXPLOIT: <name> | TOOL: <tool> | PAYLOAD: <payload or description>
-RESULT: <expected result>
-NOTES: <any notes>
-
-End your analysis with:
-RISK_LEVEL: <CRITICAL|HIGH|MEDIUM|LOW>
-SUMMARY: <2-3 sentence overall summary>
-IMPORTANT: Never use markdown bold (**text**) or 
-headers (## text). Plain text only. No exceptions.
-IMPORTANT RULES FOR ACCURACY:
-- nmap filtered or no-response means INCONCLUSIVE not vulnerable
-- Never assert a server version without seeing it in scan output
-- Never infer CVEs from guessed versions
-- curl timeouts and HTTP_CODE=000 mean the host is unreachable not exploitable
-- ab and stress tools are not Slowloris unless confirmed
-- Only assign CRITICAL if there is direct evidence of exploitability
-- If evidence is weak mark severity as LOW with note: unconfirmed"""
+- CRITICAL only if SEARCH results and endpoint evidence support exploitability.
+- Cookie consent overlays and WebGL/console warnings are not vulnerabilities.
+- For Nuclei CVE hits, name the product from the template. If the target app
+  does not match that product, SEVERITY: low and DESC must say unconfirmed false positive.
+- Missing security headers are medium or low, not critical.
+- If evidence is weak, say unconfirmed.
+"""
 
 
 # ─────────────────────────────────────────────
 # OLLAMA API CALL
 # ─────────────────────────────────────────────
 
-def ask_ollama(messages: list) -> str:
+def ask_ollama(messages: list, temperature: float = ANALYSIS_TEMPERATURE) -> str:
     try:
         payload = {
-            "model":  MODEL_NAME,
+            "model": MODEL_NAME,
             "messages": messages,
             "stream": False,
             "options": {
                 "num_predict": MAX_TOKENS,
-                "temperature": 0.7,
+                "temperature": temperature,
                 "top_p": 0.9,
-            }
+            },
         }
         print(f"\n[*] Sending to {MODEL_NAME}...")
         resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
@@ -99,6 +151,308 @@ def ask_ollama(messages: list) -> str:
 
 
 # ─────────────────────────────────────────────
+# EVIDENCE / URL / CVE HARVEST
+# ─────────────────────────────────────────────
+
+def _canonical_tool(name: str) -> str:
+    n = (name or "").lower().split("/")[-1].strip(".:")
+    if n in ("httpx-toolkit", "httpx_pd", "httpx-pd"):
+        return "httpx"
+    if n in ("curl_headers", "curl"):
+        return "curl"
+    if n in ("zap.sh", "owasp-zap", "zaproxy"):
+        return "zaproxy"
+    return n
+
+
+def extract_cves(text: str) -> list:
+    seen = []
+    for match in CVE_RE.findall(text or ""):
+        key = match.upper()
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _strip_url(url: str) -> str:
+    return url.rstrip(".,;:)'\"\\]>")
+
+
+def _session_host(target: str) -> str:
+    raw = target if "://" in target else f"http://{target}"
+    return (urlparse(raw).hostname or "").lower()
+
+
+def _same_host(url: str, host: str) -> bool:
+    if not host:
+        return False
+    parsed = urlparse(_strip_url(url))
+    h = (parsed.hostname or "").lower()
+    return h == host
+
+
+def _is_static_asset(url: str) -> bool:
+    path = urlparse(_strip_url(url)).path or ""
+    return bool(STATIC_EXT_RE.search(path))
+
+
+def harvest_urls(text: str, host: str, cap: int = MAX_DISCOVERED_URLS) -> list:
+    found = []
+    seen = set()
+    for raw in URL_RE.findall(text or ""):
+        url = _strip_url(raw)
+        if url in seen or not _same_host(url, host):
+            continue
+        seen.add(url)
+        found.append(url)
+        if len(found) >= cap:
+            break
+    return found
+
+
+def harvest_cve_urls(text: str, host: str = "") -> dict:
+    mapping = {}
+    for line in (text or "").splitlines():
+        if "CVE-" not in line.upper():
+            continue
+        match = re.search(
+            r"(CVE-\d{4}-\d+)\S*.*?(https?://[^\s<>\"']+)",
+            line,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        url = _strip_url(match.group(2))
+        if host and not _same_host(url, host):
+            continue
+        mapping[match.group(1).upper()] = url
+    return mapping
+
+
+def _xml_tag(block: str, name: str) -> str:
+    match = re.search(rf"<{name}>([^<]*)</{name}>", block, re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _zap_facts(text: str) -> list:
+    if "<alertitem>" not in text.lower() and "<OWASPZAPReport" not in text:
+        return []
+    lines = []
+    for block in re.findall(r"<alertitem>(.*?)</alertitem>", text, re.S | re.I):
+        alert = _xml_tag(block, "alert") or _xml_tag(block, "name")
+        risk = _xml_tag(block, "riskdesc")
+        uris = re.findall(r"<uri>([^<]+)</uri>", block, re.I)
+        uri = uris[0] if uris else ""
+        if alert:
+            lines.append(f"ZAP: {alert} | {risk} | {uri}")
+        if len(lines) >= 30:
+            break
+    return lines
+
+
+def _nuclei_facts(text: str) -> list:
+    lines = []
+    for line in (text or "").splitlines():
+        if NUCLEI_LINE_RE.search(line) or (line.strip().startswith("[") and "CVE-" in line.upper()):
+            lines.append(line.strip())
+        if len(lines) >= 40:
+            break
+    return lines
+
+
+def _rank_url(url: str) -> int:
+    parsed = urlparse(url)
+    if parsed.query:
+        return 0
+    if _is_static_asset(url):
+        return 3
+    path = parsed.path or ""
+    if path not in ("", "/"):
+        return 1
+    return 2
+
+
+def ranked_urls(urls: list) -> list:
+    return sorted(urls, key=_rank_url)
+
+
+def injection_target(origin: str, urls: list) -> str:
+    for url in ranked_urls(urls):
+        parsed = urlparse(url)
+        if parsed.query:
+            return url
+    for url in ranked_urls(urls):
+        parsed = urlparse(url)
+        if parsed.path not in ("", "/") and not _is_static_asset(url):
+            return url
+    return origin
+
+
+def summarize_tool_output(raw_output: str, session_host: str = "") -> str:
+    """
+    Deterministic extract: CVE/template lines, ZAP alerts, URLs, plus a short tail.
+    No second Ollama call.
+    """
+    text = (raw_output or "").strip()
+    if not text:
+        return ""
+
+    facts = _nuclei_facts(text) + _zap_facts(text)
+    urls = harvest_urls(text, session_host) if session_host else []
+
+    if len(text) < SHORT_OUTPUT and "<alertitem>" not in text.lower():
+        body = text
+    else:
+        parts = []
+        if facts:
+            parts.append("EXTRACTED FINDINGS:")
+            parts.extend(facts)
+        if urls:
+            parts.append("URLS:")
+            parts.extend(ranked_urls(urls)[:25])
+        tail_source = text
+        if "<OWASPZAPReport" in text or "<alertitem>" in text.lower():
+            tail_source = ""
+        if tail_source:
+            tail = "\n".join(tail_source.splitlines()[-TAIL_LINES:])
+            parts.append("LOG TAIL:")
+            parts.append(tail)
+        body = "\n".join(parts) if parts else text[:SHORT_OUTPUT]
+
+    if urls:
+        body += "\nDISCOVERED_URLS:\n" + "\n".join(ranked_urls(urls)[:MAX_DISCOVERED_URLS])
+
+    if len(body) > MAX_EVIDENCE_CHARS:
+        body = body[:MAX_EVIDENCE_CHARS] + "\n[truncated]"
+    return body
+
+
+def tools_from_text(text: str) -> set:
+    found = set()
+    for match in OUTPUT_HEADER_RE.finditer(text or ""):
+        found.add(_canonical_tool(match.group(1)))
+    for match in RUNNING_RE.finditer(text or ""):
+        found.add(_canonical_tool(match.group(1)))
+    return found
+
+
+def looks_like_http(target: str, recon: str) -> bool:
+    blob = f"{target}\n{recon}".lower()
+    if target.lower().startswith(("http://", "https://")):
+        return True
+    markers = (
+        "80/tcp", "443/tcp", "http", "nginx", "apache", "ssl/http",
+        "whatweb", "httpx", "text/html",
+    )
+    return any(m in blob for m in markers)
+
+
+def looks_like_wordpress(recon: str) -> bool:
+    blob = (recon or "").lower()
+    return any(x in blob for x in ("wordpress", "wp-content", "wp-login", "wp-json"))
+
+
+def preferred_origin(target: str, recon: str) -> str:
+    if target.startswith(("http://", "https://")):
+        return target
+    blob = (recon or "").lower()
+    if "https://" in blob or "443/tcp" in blob:
+        return f"https://{target}"
+    return _http_url(target)
+
+
+def missing_web_tools(ran: set, is_http: bool, is_wp: bool) -> list:
+    if not is_http:
+        return []
+    needed = list(WEB_MANDATORY)
+    needed.extend(WEB_OPTIONAL)
+    if is_wp:
+        needed.append("wpscan")
+    missing = []
+    for name in needed:
+        if name not in ran and name not in missing:
+            missing.append(name)
+    return missing
+
+
+def pending_curl_urls(cve_urls: dict, curled_urls: set) -> list:
+    pending = []
+    seen = set()
+    for url in cve_urls.values():
+        if url and url not in curled_urls and url not in seen:
+            seen.add(url)
+            pending.append(url)
+    return pending
+
+
+def build_auto_dispatch(
+    missing: list,
+    unverified_cves: list,
+    cve_urls: dict,
+    discovered: list,
+    origin: str,
+    curled_urls: set,
+) -> list:
+    calls = []
+    for cve in unverified_cves[:3]:
+        calls.append(("SEARCH", cve))
+        url = cve_urls.get(cve.upper())
+        if url and url not in curled_urls:
+            calls.append(("TOOL", f"curl {url}"))
+    if calls:
+        return calls
+
+    for url in pending_curl_urls(cve_urls, curled_urls)[:2]:
+        calls.append(("TOOL", f"curl {url}"))
+    if calls:
+        return calls
+
+    picked = []
+    for name in SCANNER_ORDER:
+        if name in missing:
+            picked.append(("TOOL", f"{name} {origin}"))
+            if len(picked) >= 2:
+                return picked
+
+    inj = injection_target(origin, discovered)
+    for name in ("sqlmap", "dalfox", "commix"):
+        if name in missing:
+            picked.append(("TOOL", f"{name} {inj}"))
+            if len(picked) >= 2:
+                break
+    return picked
+
+
+def checklist_message(
+    missing: list,
+    unverified_cves: list,
+    discovered: list,
+    loops_left: int,
+    curl_pending: list = None,
+) -> str:
+    lines = []
+    if missing:
+        lines.append("MISSING TOOLS (emit [TOOL: name TARGET] or they will be auto-run):")
+        lines.append(", ".join(missing))
+    if unverified_cves:
+        lines.append("UNVERIFIED CVEs — emit [SEARCH: CVE-…] and [TOOL: curl <hit-url>] before calling them findings:")
+        lines.append(", ".join(unverified_cves))
+    if curl_pending:
+        lines.append("CVE EVIDENCE URLS still need [TOOL: curl URL]:")
+        lines.extend(curl_pending[:5])
+    ranked = ranked_urls(discovered)[:20]
+    if ranked:
+        lines.append("DISCOVERED_URLS (use these as TARGET for sqlmap/dalfox/commix when they have parameters):")
+        lines.extend(ranked)
+    if missing or unverified_cves or curl_pending:
+        lines.append("Do not write RISK_LEVEL yet. Emit tags only for the gaps above.")
+        lines.append(f"Loops left: {loops_left}")
+    else:
+        lines.append("Checklist complete. Do not emit more tools unless a CVE still needs SEARCH.")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
 # TOOL DISPATCH
 # ─────────────────────────────────────────────
 
@@ -109,8 +463,8 @@ def extract_tool_calls(response: str) -> list:
     """
     calls = []
 
-    tool_matches   = re.findall(r'\[TOOL:\s*(.+?)\]',   response)
-    search_matches = re.findall(r'\[SEARCH:\s*(.+?)\]', response)
+    tool_matches = re.findall(r"\[TOOL:\s*(.+?)\]", response)
+    search_matches = re.findall(r"\[SEARCH:\s*(.+?)\]", response)
 
     for m in tool_matches:
         calls.append(("TOOL", m.strip()))
@@ -119,37 +473,28 @@ def extract_tool_calls(response: str) -> list:
 
     return calls
 
-def summarize_tool_output(raw_output: str) -> str:
-    """
-    Compress raw tool output into security-relevant bullet points
-    before injecting into the LLM context.
-    Keeps context size manageable across rounds.
-    """
-    if len(raw_output) < 500:
-        return raw_output
 
-    try:
-        payload = {
-            "model":  MODEL_NAME,
-            "messages": [
-    {"role": "system", "content": "You are a security data compressor. Extract only security-relevant facts. Return maximum 15 bullet points. Plain text only. No markdown."},
-    {"role": "user", "content": f"Compress this tool output:\n{raw_output[:6000]}"} ],
-            "stream": False,
-            "options": {
-                "num_predict": 512,
-                "temperature": 0.2,
-                "top_p": 0.9,
-            }
-        }
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        resp.raise_for_status()
-        summary = resp.json().get("message", {}).get("content", "").strip()
-        return summary if summary else raw_output
-    except Exception:
-        return raw_output
-def run_tool_calls(calls: list) -> str:
+def record_calls(calls: list, ran_tools: set, searched_cves: set, curled_urls: set) -> None:
+    for call_type, content in calls:
+        if call_type == "SEARCH":
+            for cve in extract_cves(content):
+                searched_cves.add(cve)
+            continue
+        if call_type != "TOOL":
+            continue
+        parts = content.split()
+        if not parts:
+            continue
+        ran_tools.add(_canonical_tool(parts[0]))
+        if _canonical_tool(parts[0]) == "curl":
+            for token in parts[1:]:
+                if token.startswith("http://") or token.startswith("https://"):
+                    curled_urls.add(_strip_url(token))
+
+
+def run_tool_calls(calls: list, session_host: str = "") -> str:
     """
-    Execute all tool/search calls and return combined results string.
+    Execute all tool/search calls and return combined evidence string.
     """
     if not calls:
         return ""
@@ -165,7 +510,7 @@ def run_tool_calls(calls: list) -> str:
         else:
             output = f"[!] Unknown call type: {call_type}"
 
-        compressed = summarize_tool_output(output.strip())
+        compressed = summarize_tool_output(output.strip(), session_host)
         results += f"\n[{call_type} RESULT: {call_content}]\n"
         results += "─" * 40 + "\n"
         results += compressed + "\n"
@@ -176,8 +521,12 @@ def run_tool_calls(calls: list) -> str:
 # ─────────────────────────────────────────────
 # PARSER — extract structured data from AI output
 # ─────────────────────────────────────────────
+
 def _clean(line: str) -> str:
-    return re.sub(r'\*+', '', line).strip()
+    line = re.sub(r"\*+", "", line)
+    return line.replace("`", "").strip()
+
+
 def parse_vulnerabilities(response: str) -> list:
     """
     Parse VULN: lines from AI response into dicts.
@@ -196,10 +545,9 @@ def parse_vulnerabilities(response: str) -> list:
                 "port":        "",
                 "service":     "",
                 "description": "",
-                "fix":         ""
+                "fix":         "",
             }
 
-            # parse header line: VULN: name | SEVERITY: x | PORT: x | SERVICE: x
             parts = line.split("|")
             for part in parts:
                 part = part.strip()
@@ -212,7 +560,6 @@ def parse_vulnerabilities(response: str) -> list:
                 elif part.startswith("SERVICE:"):
                     vuln["service"] = part.replace("SERVICE:", "").strip()
 
-            # look ahead for DESC: and FIX: lines
             j = i + 1
             while j < len(lines) and j <= i + 5:
                 next_line = _clean(lines[j])
@@ -249,7 +596,7 @@ def parse_exploits(response: str) -> list:
                 "tool_used":    "",
                 "payload":      "",
                 "result":       "unknown",
-                "notes":        ""
+                "notes":        "",
             }
 
             parts = line.split("|")
@@ -282,14 +629,30 @@ def parse_exploits(response: str) -> list:
 
 
 def parse_risk_level(response: str) -> str:
-    """Extract RISK_LEVEL from AI response."""
-    match = re.search(r'RISK_LEVEL:\s*(CRITICAL|HIGH|MEDIUM|LOW)', response, re.IGNORECASE)
+    """Extract RISK_LEVEL from AI response (tolerate markdown/backticks)."""
+    cleaned = (response or "").replace("`", "")
+    match = re.search(
+        r"(?<![A-Z_])RISK_LEVEL:\s*[*_#]*\s*(CRITICAL|HIGH|MEDIUM|LOW)",
+        cleaned,
+        re.IGNORECASE,
+    )
     return match.group(1).upper() if match else "UNKNOWN"
 
 
 def parse_summary(response: str) -> str:
-    match = re.search(r'SUMMARY:\s*(.+)', response, re.IGNORECASE)
+    match = re.search(
+        r"(?<![A-Z_])SUMMARY:\s*(.+)",
+        response or "",
+        re.IGNORECASE,
+    )
     return match.group(1).strip() if match else ""
+
+
+def _cap_evidence(chunks: list) -> str:
+    blob = "\n".join(chunks)
+    if len(blob) <= MAX_EVIDENCE_CHARS:
+        return blob
+    return blob[-MAX_EVIDENCE_CHARS:]
 
 
 # ─────────────────────────────────────────────
@@ -297,71 +660,128 @@ def parse_summary(response: str) -> str:
 # ─────────────────────────────────────────────
 
 def analyse_target(target: str, raw_scan: str) -> dict:
+    host = _session_host(target)
+    origin = preferred_origin(target, raw_scan)
+    is_http = looks_like_http(target, raw_scan)
+    is_wp = looks_like_wordpress(raw_scan)
+
+    ran_tools = tools_from_text(raw_scan)
+    searched_cves = set()
+    curled_urls = set()
+    discovered = harvest_urls(raw_scan, host)
+    all_cves = extract_cves(raw_scan)
+    cve_urls = harvest_cve_urls(raw_scan, host)
+    evidence_chunks = []
+    transcript = []
+
     messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        },
+        {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": f"""TARGET: {target}
-
-RECON DATA:
-{raw_scan}
-
-Analyze this target completely. Use [TOOL:] or [SEARCH:] if you need more information.
-List all vulnerabilities, fixes, and suggest exploits where applicable."""
-        }
+            "content": (
+                f"TARGET: {target}\nORIGIN: {origin}\n\n"
+                f"RECON DATA:\n{raw_scan}\n\n"
+                "This is a tool round. Emit [TOOL: name TARGET] and [SEARCH: CVE] tags.\n"
+                "TARGET may be a discovered URL, not only the origin.\n"
+                "Do not invent flags. Do not write RISK_LEVEL yet."
+            ),
+        },
     ]
 
-    final_response = ""
-
     for loop in range(MAX_TOOL_LOOPS):
-        response = ask_ollama(messages)
+        missing = missing_web_tools(ran_tools, is_http, is_wp)
+        unverified = [c for c in all_cves if c not in searched_cves]
+        curl_pending = pending_curl_urls(cve_urls, curled_urls)
+        loops_left = MAX_TOOL_LOOPS - loop
 
+        response = ask_ollama(messages)
         print(f"\n{'─'*60}")
         print(f"[METATRON - Round {loop + 1}]")
         print(f"{'─'*60}")
         print(response)
+        transcript.append(response)
 
-        final_response = response
+        calls = extract_tool_calls(response)
+        auto = False
+        if not calls:
+            if missing or unverified or curl_pending:
+                calls = build_auto_dispatch(
+                    missing, unverified, cve_urls, discovered, origin, curled_urls,
+                )
+                auto = bool(calls)
+                if auto:
+                    print(f"\n[*] Auto-dispatch ({len(calls)}): "
+                          + ", ".join(f"{t} {c}" for t, c in calls))
+            if not calls:
+                print("\n[*] Checklist complete or no further tools. Moving to finalize.")
+                break
 
-        tool_calls = extract_tool_calls(response)
-        if not tool_calls:
-            print("\n[*] No tool calls. Analysis complete.")
-            break
+        record_calls(calls, ran_tools, searched_cves, curled_urls)
+        tool_results = run_tool_calls(calls, session_host=host)
+        evidence_chunks.append(tool_results)
 
-        tool_results = run_tool_calls(tool_calls)
+        all_cves = list(dict.fromkeys(all_cves + extract_cves(tool_results)))
+        cve_urls.update(harvest_cve_urls(tool_results, host))
+        for url in harvest_urls(tool_results, host):
+            if url not in discovered:
+                discovered.append(url)
 
-        # add assistant response and tool results as new messages
-        messages.append({
-            "role": "assistant",
-            "content": response
-        })
+        messages.append({"role": "assistant", "content": response})
+        missing = missing_web_tools(ran_tools, is_http, is_wp)
+        unverified = [c for c in all_cves if c not in searched_cves]
+        curl_pending = pending_curl_urls(cve_urls, curled_urls)
+        nudge = checklist_message(
+            missing, unverified, discovered, loops_left - 1, curl_pending,
+        )
+        prefix = "[AUTO-DISPATCH RESULTS]\n" if auto else "[TOOL RESULTS]\n"
         messages.append({
             "role": "user",
-            "content": f"""[TOOL RESULTS]
-{tool_results}
-
-Continue your analysis with this new information.
-If analysis is complete, give the final RISK_LEVEL and SUMMARY."""
+            "content": f"{prefix}{tool_results}\n\n{nudge}",
         })
 
-    vulnerabilities = parse_vulnerabilities(final_response)
-    exploits        = parse_exploits(final_response)
-    risk_level      = parse_risk_level(final_response)
-    summary         = parse_summary(final_response)
+        if not missing and not unverified and not curl_pending:
+            print("\n[*] Tool checklist and CVE SEARCH complete.")
+            break
+
+    evidence = _cap_evidence(evidence_chunks)
+    recon_clip = (raw_scan or "")[:4000]
+    finalize_user = (
+        f"TARGET: {target}\nORIGIN: {origin}\n\n"
+        f"RECON HIGHLIGHTS:\n{recon_clip}\n\n"
+        f"TOOL EVIDENCE:\n{evidence}\n\n"
+        f"SEARCHED CVEs: {', '.join(sorted(searched_cves)) or 'none'}\n"
+        f"DISCOVERED_URLS:\n" + "\n".join(ranked_urls(discovered)[:20]) + "\n\n"
+        "Write the schema-only report now."
+    )
+    print(f"\n{'─'*60}")
+    print("[METATRON - Finalize]")
+    print(f"{'─'*60}")
+    finalize_response = ask_ollama(
+        [
+            {"role": "system", "content": FINALIZE_PROMPT},
+            {"role": "user", "content": finalize_user},
+        ]
+    )
+    print(finalize_response)
+    transcript.append(finalize_response)
+
+    vulnerabilities = parse_vulnerabilities(finalize_response)
+    exploits = parse_exploits(finalize_response)
+    risk_level = parse_risk_level(finalize_response)
+    summary = parse_summary(finalize_response)
 
     print(f"\n[+] Parsed: {len(vulnerabilities)} vulns, {len(exploits)} exploits | Risk: {risk_level}")
 
     return {
-        "full_response":   final_response,
+        "full_response": "\n\n".join(transcript),
         "vulnerabilities": vulnerabilities,
-        "exploits":        exploits,
-        "risk_level":      risk_level,
-        "summary":         summary,
-        "raw_scan":        raw_scan
+        "exploits": exploits,
+        "risk_level": risk_level,
+        "summary": summary,
+        "raw_scan": raw_scan,
     }
+
+
 # ─────────────────────────────────────────────
 # QUICK TEST
 # ─────────────────────────────────────────────
@@ -369,7 +789,6 @@ If analysis is complete, give the final RISK_LEVEL and SUMMARY."""
 if __name__ == "__main__":
     print("[ llm.py test — direct AI query ]\n")
 
-    # test if ollama is reachable
     try:
         r = requests.get("http://localhost:11434", timeout=5)
         print("[+] Ollama is running.")
