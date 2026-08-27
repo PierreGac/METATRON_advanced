@@ -178,21 +178,55 @@ def _strip_url(url: str) -> str:
     return url.rstrip(".,;:)'\"\\]>")
 
 
+def _parse_url(url: str):
+    """urlparse that never raises on junk scanner output."""
+    if not url:
+        return None
+    try:
+        return urlparse(_strip_url(url))
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_truncated_bracket_url(url: str, parsed) -> bool:
+    """Drop placeholders like https://host/[... where ] was stripped by URL_RE."""
+    if parsed is None:
+        return True
+    stripped = _strip_url(url)
+    if stripped.count("[") > stripped.count("]"):
+        return True
+    path = parsed.path or ""
+    netloc = parsed.netloc or ""
+    if path.startswith("[") and "]" not in path:
+        return True
+    if netloc.startswith("[") and "]" not in netloc:
+        return True
+    return False
+
+
 def _session_host(target: str) -> str:
     raw = target if "://" in target else f"http://{target}"
-    return (urlparse(raw).hostname or "").lower()
+    parsed = _parse_url(raw)
+    if parsed is None:
+        return ""
+    return (parsed.hostname or "").lower()
 
 
 def _same_host(url: str, host: str) -> bool:
     if not host:
         return False
-    parsed = urlparse(_strip_url(url))
+    parsed = _parse_url(url)
+    if parsed is None:
+        return False
     h = (parsed.hostname or "").lower()
     return h == host
 
 
 def _is_static_asset(url: str) -> bool:
-    path = urlparse(_strip_url(url)).path or ""
+    parsed = _parse_url(url)
+    if parsed is None:
+        return False
+    path = parsed.path or ""
     return bool(STATIC_EXT_RE.search(path))
 
 
@@ -201,6 +235,9 @@ def harvest_urls(text: str, host: str, cap: int = MAX_DISCOVERED_URLS) -> list:
     seen = set()
     for raw in URL_RE.findall(text or ""):
         url = _strip_url(raw)
+        parsed = _parse_url(url)
+        if parsed is None or _is_truncated_bracket_url(url, parsed):
+            continue
         if url in seen or not _same_host(url, host):
             continue
         seen.add(url)
@@ -223,6 +260,8 @@ def harvest_cve_urls(text: str, host: str = "") -> dict:
         if not match:
             continue
         url = _strip_url(match.group(2))
+        if _parse_url(url) is None:
+            continue
         if host and not _same_host(url, host):
             continue
         mapping[match.group(1).upper()] = url
@@ -261,7 +300,9 @@ def _nuclei_facts(text: str) -> list:
 
 
 def _rank_url(url: str) -> int:
-    parsed = urlparse(url)
+    parsed = _parse_url(url)
+    if parsed is None:
+        return 4
     if parsed.query:
         return 0
     if _is_static_asset(url):
@@ -278,11 +319,15 @@ def ranked_urls(urls: list) -> list:
 
 def injection_target(origin: str, urls: list) -> str:
     for url in ranked_urls(urls):
-        parsed = urlparse(url)
+        parsed = _parse_url(url)
+        if parsed is None or _is_truncated_bracket_url(url, parsed):
+            continue
         if parsed.query:
             return url
     for url in ranked_urls(urls):
-        parsed = urlparse(url)
+        parsed = _parse_url(url)
+        if parsed is None or _is_truncated_bracket_url(url, parsed):
+            continue
         if parsed.path not in ("", "/") and not _is_static_asset(url):
             return url
     return origin
