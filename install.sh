@@ -204,18 +204,19 @@ if ! command -v httpx-toolkit &>/dev/null && [[ -n "${GO_BIN:-}" && -x "$GO_BIN/
     echo "    (Metatron uses httpx-toolkit or GOPATH/bin/httpx, not Python httpx)"
 fi
 
-if ! command -v commix &>/dev/null; then
-    if [[ ! -d /opt/commix ]]; then
-        git clone --depth 1 https://github.com/commixproject/commix.git /opt/commix || true
-    fi
-    if [[ -f /opt/commix/commix.py ]]; then
-        cat >/usr/local/bin/commix <<'EOF'
+echo "[*] commix from GitHub (Debian/Ubuntu apt is often stale)..."
+if [[ -d /opt/commix/.git ]]; then
+    git -C /opt/commix pull --ff-only || true
+elif [[ ! -d /opt/commix ]]; then
+    git clone --depth 1 https://github.com/commixproject/commix.git /opt/commix || true
+fi
+if [[ -f /opt/commix/commix.py ]]; then
+    cat >/usr/local/bin/commix <<'EOF'
 #!/usr/bin/env bash
 exec python3 /opt/commix/commix.py "$@"
 EOF
-        chmod +x /usr/local/bin/commix
-        echo "[+] Installed commix wrapper -> /usr/local/bin/commix"
-    fi
+    chmod +x /usr/local/bin/commix /opt/commix/commix.py
+    echo "[+] commix -> /usr/local/bin/commix (GitHub /opt/commix)"
 fi
 
 if ! command -v wpscan &>/dev/null; then
