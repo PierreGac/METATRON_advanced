@@ -21,7 +21,7 @@ AI-powered penetration testing assistant using local LLM on linux (Parrot OS)
 
 **Metatron** is a CLI-based AI penetration testing assistant that runs entirely on your local machine — no cloud, no API keys, no subscriptions.
 
-You give it a target IP or domain. It runs recon and web-testing tools (nmap, whois, whatweb, curl, dig, nikto, gobuster, sslscan, nuclei, sqlmap, and more), feeds results to a locally running AI model, and the AI analyzes the target, identifies vulnerabilities, suggests exploits, and recommends fixes. Everything gets saved to a MariaDB database with full scan history. Full tool logs are also written under `scan_results/`.
+You give it a target IP or domain. It runs recon and web-testing tools (nmap, whois, whatweb, curl, dig, nikto, gobuster, sslscan, nuclei, sqlmap, searchsploit, gau, subfinder, masscan, and more), feeds results to a locally running AI model, and the AI analyzes the target, identifies vulnerabilities, suggests exploits, and recommends fixes. Everything gets saved to a MariaDB database with full scan history. Full tool logs are also written under `scan_results/`.
 
 ---
 
@@ -158,7 +158,7 @@ Metatron calls host binaries by name. Packages below are typical on **Kali**; **
 
 ```bash
 sudo apt update
-sudo apt install nmap whois whatweb curl dnsutils nikto gobuster arp-scan sslscan
+sudo apt install nmap whois whatweb curl dnsutils nikto gobuster arp-scan sslscan masscan
 ```
 
 **Web testers (apt — skip any name your distro does not ship)**
@@ -182,6 +182,8 @@ export PATH="$(go env GOPATH)/bin:$PATH"
 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install -v github.com/projectdiscovery/katana/cmd/katana@latest
 go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/lc/gau/v2/cmd/gau@latest
 go install -v github.com/hahwul/dalfox/v2@latest
 go install github.com/ffuf/ffuf/v2@latest
 ```
@@ -197,21 +199,49 @@ go install github.com/ffuf/ffuf/v2@latest
 | commix | `git clone https://github.com/commixproject/commix.git` then `sudo ln -s "$PWD/commix/commix.py" /usr/local/bin/commix` |
 | wpscan | `sudo gem install wpscan` (needs Ruby) |
 | zaproxy | `sudo apt install zaproxy` or install OWASP ZAP; binary may be `zap.sh` under `/usr/share/zaproxy/` (Metatron also looks for `zap.sh` / `owasp-zap`) |
-| nuclei / katana / httpx | Go install + PATH as above |
+| nuclei / katana / httpx / subfinder | Go install + PATH as above |
+| gau | `go install github.com/lc/gau/v2/cmd/gau@latest` |
+| searchsploit | `sudo git clone https://github.com/offensive-security/exploitdb.git /opt/exploitdb` then `sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit`. Papers: `sudo git clone https://github.com/offensive-security/exploitdb-papers.git /opt/exploitdb-papers` (install.sh does this) |
+| masscan | `sudo apt install masscan` (LAN hosts only — Metatron refuses public IPs/domains) |
 | testssl.sh | `sudo apt install testssl.sh` or clone https://github.com/drwetter/testssl.sh |
 
-Wordlists for gobuster/ffuf:
+Wordlists for gobuster/ffuf come from **SecLists** (~2 GB). `install.sh` tries the `seclists` apt package first. On Parrot/Debian that package is often missing, so the fallback is a shallow clone with the repo root at `/usr/share/wordlists` (so `Discovery/` sits next to any existing lists):
 
 ```bash
-sudo apt install dirb
-# expects /usr/share/wordlists/dirb/common.txt on Kali; Ubuntu dirb uses
-# /usr/share/dirb/wordlists/common.txt (Metatron falls back automatically)
+sudo apt install seclists   # Kali/Parrot if the package exists
+# if apt has no seclists package:
+sudo git clone --depth 1 https://github.com/danielmiessler/SecLists.git /usr/share/wordlists
 ```
+
+If `/usr/share/wordlists` already exists and is not empty, `install.sh` still clones, then copies SecLists trees (`Discovery`, `Fuzzing`, …) into that directory without overwriting files already there.
+
+Metatron auto-detects the root in this order: `_global.wordlists_root` in `tools_config.json`, then `/usr/share/wordlists` (if `Discovery/` is there), `/usr/share/seclists`, and `/usr/share/wordlists/seclists`. Dirb `common.txt` is a last-resort fallback only.
+
+The AI can switch lists with an allowlisted scenario (never a raw filesystem path):
+
+```
+[TOOL: gobuster https://host SCENARIO:wordpress]
+[TOOL: ffuf https://host/api/v1 SCENARIO:api]
+[TOOL: ffuf https://host/page?id=1 SCENARIO:sqli]
+```
+
+| Scenario | Typical use | Wordlist (under the SecLists root) |
+|----------|-------------|-------------------------------------|
+| *(default gobuster)* | directory busting | `Discovery/Web-Content/big.txt` |
+| *(default ffuf)* | directory busting | `Discovery/Web-Content/directory-list-2.3-big.txt` |
+| `wordpress` | WordPress paths | `Discovery/Web-Content/CMS/wordpress.fuzz.txt` |
+| `api` | API endpoints | `Discovery/Web-Content/api/api-endpoints.txt` |
+| `backups` | leftover/backup files | `Discovery/Web-Content/Common-DB-Backups.txt` |
+| `sqli` | SQLi payloads (ffuf) | `Fuzzing/Databases/SQLi/Generic-SQLi.txt` |
+| `xss` | XSS payloads (ffuf) | `Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt` |
+| `parameters` | parameter names (ffuf) | `Discovery/Web-Content/burp-parameter-names.txt` |
+
+Edit named lists under the `wordlists` key in [`tools_config.json`](tools_config.json). JSON cannot change `argv[0]`. Extra flags the model writes are still ignored.
 
 Check what is actually on PATH:
 
 ```bash
-command -v nmap gobuster sqlmap ffuf dalfox nuclei katana httpx-toolkit wapiti commix wpscan zaproxy
+command -v nmap gobuster sqlmap ffuf dalfox nuclei katana httpx-toolkit wapiti commix wpscan zaproxy searchsploit gau subfinder masscan
 ```
 
 If you already ran `pip install -r requirements.txt` but skipped browsers, run step 4 now — you do not need to reinstall Python packages.
@@ -408,10 +438,16 @@ or
   [19] wpscan
   [20] zaproxy
   [21] playwright
+  [22] searchsploit
+  [23] gau
+  [24] subfinder
+  [25] masscan
   [a] Legacy: nmap, whois, whatweb, curl, dig
   [n] Legacy: same as [a] plus nikto
   [m] Run all tools
 ```
+
+`masscan` only runs when the target resolves entirely to RFC1918, loopback, or link-local addresses. Public hosts are skipped with a notice. `gau` and `subfinder` skip IP targets. `searchsploit` takes a product/version query (not a URL).
 
 **4. Review or edit configuration** for the selected tools (`tools_config.json`). Each tool is shown in its own `=== name ===` block. Press Enter to run, or `e` to edit the JSON in `$EDITOR` (nano by default).
 
@@ -427,9 +463,9 @@ or
 
 ## ⚙️ Tool configuration
 
-[`tools_config.json`](tools_config.json) controls timeouts, flags, wordlists, crawl depth, ZAP spider limits, and Playwright click settings. JSON cannot change the binary name (`argv[0]`). AI `[TOOL: name TARGET]` tags use the same JSON flags — extra flags the model writes are ignored. The AI may only change **TARGET** (origin or a discovered same-host URL). The analysis loop auto-runs missing web scanners if the model forgets tags, searches unverified CVEs, then does a schema-only finalize pass; **that** finalize output is what is parsed into MariaDB.
+[`tools_config.json`](tools_config.json) controls timeouts, flags, wordlists, crawl depth, ZAP spider limits, and Playwright click settings. JSON cannot change the binary name (`argv[0]`). AI `[TOOL: name TARGET]` tags use the same JSON flags — extra flags the model writes are ignored. The AI may change **TARGET** (origin or a discovered same-host URL) and an optional **SCENARIO** name for gobuster/ffuf wordlists. The analysis loop auto-runs missing web scanners if the model forgets tags, searches unverified CVEs, then does a schema-only finalize pass; **that** finalize output is what is parsed into MariaDB.
 
-Placeholders in `args`: `{target}`, `{url}`, `{wordlist}`, `{crawl}`, `{depth}`. Gobuster/ffuf fall back to `/usr/share/dirb/wordlists/common.txt` when the Kali wordlist path is missing. Katana includes `-jc` (JS crawl) for SPAs. Playwright dismisses cookie/consent dialogs before other clicks.
+Placeholders in `args`: `{target}`, `{url}`, `{host}`, `{wordlist}`, `{crawl}`, `{depth}`. `{host}` is the hostname (no scheme or path) for tools like gau/subfinder. Relative wordlist paths are resolved against the detected SecLists root (usually `/usr/share/wordlists` after the git clone, or `/usr/share/seclists` / `/usr/share/wordlists/seclists` from apt). Dirb `common.txt` is used only if SecLists is missing. Katana includes `-jc` (JS crawl) for SPAs. Playwright dismisses cookie/consent dialogs before other clicks.
 
 Append extra flags with `extra_args`. Global keys:
 
@@ -437,9 +473,12 @@ Append extra flags with `extra_args`. Global keys:
 "_global": {
   "max_log_lines": 2000,
   "timeout_retry_multiplier": 2,
-  "results_dir": "scan_results"
+  "results_dir": "scan_results",
+  "wordlists_root": ""
 }
 ```
+
+Leave `wordlists_root` empty to auto-detect. Set it to override (for example a git clone elsewhere). Named scenarios live in the top-level `wordlists` object.
 
 ZAP defaults cap spider children/depth/duration so `-quickurl` does not run unbounded. Playwright stays on the start host unless you set `allowed_hosts` or `allow_subdomains`.
 

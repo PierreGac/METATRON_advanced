@@ -75,7 +75,7 @@ CORE_PKGS=(
     python3 python3-pip python3-venv python3-dev
     git curl wget
     golang-go
-    nmap whois whatweb dnsutils nikto gobuster arp-scan sslscan
+    nmap whois whatweb dnsutils nikto gobuster arp-scan sslscan masscan
     dirb
     mariadb-server
 )
@@ -96,6 +96,9 @@ echo "  Web testers (optional if missing on Parrot):"
 for pkg in "${WEB_PKGS[@]}"; do
     apt_try "$pkg"
 done
+
+echo "  SecLists wordlists (~2 GB, used by gobuster/ffuf):"
+apt_try seclists
 
 # =============================================================================
 # STEP 2: Python venv + Playwright
@@ -123,7 +126,7 @@ echo "[*] Playwright OS libraries (root)..."
 # STEP 3: Go PATH + ProjectDiscovery / ffuf / dalfox
 # =============================================================================
 
-echo -e "\n${GREEN}[3/7] Go tools (nuclei, katana, httpx, dalfox, ffuf)...${NC}"
+echo -e "\n${GREEN}[3/7] Go tools (nuclei, katana, httpx, dalfox, ffuf, gau, subfinder)...${NC}"
 
 if ! command -v go &>/dev/null; then
     echo -e "${YELLOW}[!] go not on PATH; skip Go installs.${NC}"
@@ -147,6 +150,8 @@ else
     run_user "export PATH=\"$GO_BIN:\$PATH\"; go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
     run_user "export PATH=\"$GO_BIN:\$PATH\"; go install -v github.com/hahwul/dalfox/v2@latest"
     run_user "export PATH=\"$GO_BIN:\$PATH\"; go install github.com/ffuf/ffuf/v2@latest"
+    run_user "export PATH=\"$GO_BIN:\$PATH\"; go install github.com/lc/gau/v2/cmd/gau@latest"
+    run_user "export PATH=\"$GO_BIN:\$PATH\"; go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
 fi
 
 # =============================================================================
@@ -198,10 +203,42 @@ fi
 if ! command -v katana &>/dev/null && [[ -n "${GO_BIN:-}" && -x "$GO_BIN/katana" ]]; then
     ln -sf "$GO_BIN/katana" /usr/local/bin/katana
 fi
+if ! command -v gau &>/dev/null && [[ -n "${GO_BIN:-}" && -x "$GO_BIN/gau" ]]; then
+    ln -sf "$GO_BIN/gau" /usr/local/bin/gau
+fi
+if ! command -v subfinder &>/dev/null && [[ -n "${GO_BIN:-}" && -x "$GO_BIN/subfinder" ]]; then
+    ln -sf "$GO_BIN/subfinder" /usr/local/bin/subfinder
+fi
 if ! command -v httpx-toolkit &>/dev/null && [[ -n "${GO_BIN:-}" && -x "$GO_BIN/httpx" ]]; then
     ln -sf "$GO_BIN/httpx" /usr/local/bin/httpx-pd
     echo "[+] Linked ProjectDiscovery httpx -> /usr/local/bin/httpx-pd"
     echo "    (Metatron uses httpx-toolkit or GOPATH/bin/httpx, not Python httpx)"
+fi
+
+echo "[*] searchsploit from GitHub (Exploit-DB + papers)..."
+if [[ -d /opt/exploitdb/.git ]]; then
+    git -C /opt/exploitdb pull --ff-only || true
+elif [[ ! -d /opt/exploitdb ]]; then
+    git clone https://github.com/offensive-security/exploitdb.git /opt/exploitdb || true
+fi
+if [[ -f /opt/exploitdb/searchsploit ]]; then
+    chmod +x /opt/exploitdb/searchsploit
+    ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit
+    echo "[+] searchsploit -> /usr/local/bin/searchsploit (GitHub /opt/exploitdb)"
+fi
+if [[ -d /opt/exploitdb-papers/.git ]]; then
+    git -C /opt/exploitdb-papers pull --ff-only || true
+elif [[ ! -d /opt/exploitdb-papers ]]; then
+    git clone https://github.com/offensive-security/exploitdb-papers.git /opt/exploitdb-papers || true
+fi
+if [[ -f /opt/exploitdb/.searchsploit_rc ]]; then
+    if [[ ! -f "$REAL_HOME/.searchsploit_rc" ]]; then
+        cp /opt/exploitdb/.searchsploit_rc "$REAL_HOME/.searchsploit_rc"
+        chown "$REAL_USER:" "$REAL_HOME/.searchsploit_rc" 2>/dev/null || true
+    fi
+    if [[ ! -f /root/.searchsploit_rc ]]; then
+        cp /opt/exploitdb/.searchsploit_rc /root/.searchsploit_rc
+    fi
 fi
 
 echo "[*] commix from GitHub (Debian/Ubuntu apt is often stale)..."
@@ -232,6 +269,64 @@ if ! command -v testssl.sh &>/dev/null && [[ ! -x /usr/bin/testssl.sh ]]; then
         ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh
         chmod +x /opt/testssl.sh/testssl.sh
         echo "[+] Linked testssl.sh"
+    fi
+fi
+
+echo "[*] SecLists wordlists..."
+seclists_present() {
+    [[ -d /usr/share/seclists/Discovery ]] \
+    || [[ -d /usr/share/wordlists/seclists/Discovery ]] \
+    || [[ -d /usr/share/wordlists/Discovery ]]
+}
+
+# Clone layout used on Parrot: SecLists repo root is /usr/share/wordlists
+# (Discovery/Web-Content/... lives directly under wordlists).
+clone_seclists_to_wordlists() {
+    local dest="/usr/share/wordlists"
+    local repo="https://github.com/danielmiessler/SecLists.git"
+    if [[ ! -e "$dest" ]] || [[ -d "$dest" && -z "$(ls -A "$dest" 2>/dev/null)" ]]; then
+        git clone --depth 1 "$repo" "$dest"
+        return $?
+    fi
+    echo "[*] $dest already exists — cloning to a temp dir and copying SecLists trees in..."
+    local tmp
+    tmp="$(mktemp -d /tmp/seclists.XXXXXX)" || return 1
+    if ! git clone --depth 1 "$repo" "$tmp/SecLists"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    local item name
+    for item in "$tmp/SecLists"/*; do
+        name="$(basename "$item")"
+        [[ "$name" == ".git" ]] && continue
+        if [[ -e "$dest/$name" ]]; then
+            echo "    skip $name (already in $dest)"
+            continue
+        fi
+        cp -a "$item" "$dest/$name"
+        echo "    + $dest/$name"
+    done
+    rm -rf "$tmp"
+    [[ -d "$dest/Discovery" ]]
+}
+
+if seclists_present; then
+    echo "[+] SecLists already present"
+else
+    echo "[*] Cloning SecLists into /usr/share/wordlists (~2 GB, this can take a while)..."
+    mkdir -p /usr/share/wordlists
+    if clone_seclists_to_wordlists; then
+        echo "[+] SecLists -> /usr/share/wordlists (Discovery/, Fuzzing/, ...)"
+    else
+        echo -e "${YELLOW}[!] SecLists clone failed. Manual install:${NC}"
+        echo "    sudo git clone --depth 1 https://github.com/danielmiessler/SecLists.git /usr/share/wordlists"
+    fi
+fi
+if [[ -d /usr/share/seclists/Discovery ]]; then
+    mkdir -p /usr/share/wordlists
+    if [[ ! -e /usr/share/wordlists/seclists ]]; then
+        ln -s /usr/share/seclists /usr/share/wordlists/seclists
+        echo "[+] Linked /usr/share/wordlists/seclists -> /usr/share/seclists"
     fi
 fi
 
@@ -368,7 +463,7 @@ check_cmd() {
 echo ""
 echo "Checking tools:"
 for tool in nmap nikto whatweb gobuster arp-scan sslscan sqlmap wapiti ffuf \
-            dalfox commix wpscan nuclei katana ollama; do
+            dalfox commix wpscan nuclei katana searchsploit gau subfinder masscan ollama; do
     check_cmd "$tool"
 done
 
@@ -394,6 +489,14 @@ if run_user "ollama list 2>/dev/null | grep -q metatron-qwen"; then
     echo -e "  [${GREEN}✓${NC}] ollama model metatron-qwen"
 else
     echo -e "  [${YELLOW}~${NC}] ollama model metatron-qwen (not listed yet)"
+fi
+
+if [[ -f /usr/share/seclists/Discovery/Web-Content/common.txt ]] \
+   || [[ -f /usr/share/wordlists/seclists/Discovery/Web-Content/common.txt ]] \
+   || [[ -f /usr/share/wordlists/Discovery/Web-Content/common.txt ]]; then
+    echo -e "  [${GREEN}✓${NC}] SecLists (Discovery/Web-Content/common.txt)"
+else
+    echo -e "  [${RED}✗${NC}] SecLists (sudo git clone --depth 1 https://github.com/danielmiessler/SecLists.git /usr/share/wordlists)"
 fi
 
 echo ""

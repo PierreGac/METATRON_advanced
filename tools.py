@@ -7,17 +7,19 @@ OS: Parrot OS (tools pre-installed or easily available)
 """
 
 import copy
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -38,35 +40,98 @@ TOOL_INSTALL_HINTS = {
     "testssl.sh": "sudo apt install testssl.sh",
     "zaproxy": "sudo apt install zaproxy  # binary may be zap.sh",
     "arp-scan": "sudo apt install arp-scan",
+    "seclists": "sudo apt install seclists",
+    "searchsploit": "sudo git clone https://github.com/offensive-security/exploitdb.git /opt/exploitdb && sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit && sudo git clone https://github.com/offensive-security/exploitdb-papers.git /opt/exploitdb-papers",
+    "gau": "go install github.com/lc/gau/v2/cmd/gau@latest  # then: export PATH=\"$(go env GOPATH)/bin:$PATH\"",
+    "subfinder": "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+    "masscan": "sudo apt install masscan",
 }
 
-DEFAULT_WORDLIST = "/usr/share/wordlists/dirb/common.txt"
-WORDLIST_CANDIDATES = (
+DEFAULT_WORDLIST = "Discovery/Web-Content/common.txt"
+DIRB_FALLBACKS = (
     "/usr/share/wordlists/dirb/common.txt",
     "/usr/share/dirb/wordlists/common.txt",
 )
+SECLISTS_ROOT_CANDIDATES = (
+    "/usr/share/wordlists",
+    "/usr/share/seclists",
+    "/usr/share/wordlists/seclists",
+)
+WORDLIST_ABS_PREFIXES = (
+    "/usr/share/seclists/",
+    "/usr/share/wordlists/seclists/",
+    "/usr/share/wordlists/",
+)
+DIR_FILE_PREFS = (
+    "common.txt",
+    "wordpress.fuzz.txt",
+    "api-endpoints.txt",
+    "Generic-SQLi.txt",
+    "XSS-Jhaddix.txt",
+    "burp-parameter-names.txt",
+    "big.txt",
+    "directory-list-2.3-medium.txt",
+    "Common-DB-Backups.txt",
+)
+WORDLIST_TAG_RE = re.compile(r"^(?:SCENARIO|WORDLIST):(.+)$", re.IGNORECASE)
+
+DEFAULT_WORDLISTS = {
+    "wordpress": {
+        "path": "Discovery/Web-Content/CMS/wordpress.fuzz.txt",
+        "tools": ["gobuster", "ffuf"],
+        "mode": "path",
+    },
+    "api": {
+        "path": "Discovery/Web-Content/api/api-endpoints.txt",
+        "tools": ["gobuster", "ffuf"],
+        "mode": "path",
+    },
+    "backups": {
+        "path": "Discovery/Web-Content/Common-DB-Backups.txt",
+        "tools": ["gobuster", "ffuf"],
+        "mode": "path",
+    },
+    "sqli": {
+        "path": "Fuzzing/Databases/SQLi/Generic-SQLi.txt",
+        "fallbacks": ["Fuzzing/SQLi/Generic-SQLi.txt"],
+        "tools": ["ffuf"],
+        "mode": "value",
+    },
+    "xss": {
+        "path": "Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
+        "tools": ["ffuf", "dalfox"],
+        "mode": "value",
+    },
+    "parameters": {
+        "path": "Discovery/Web-Content/burp-parameter-names.txt",
+        "tools": ["ffuf"],
+        "mode": "param",
+    },
+}
 
 DEFAULT_CONFIG = {
     "_global": {
         "max_log_lines": 2000,
         "timeout_retry_multiplier": 2,
         "results_dir": "scan_results",
+        "wordlists_root": "",
     },
-    "nmap": {"timeout": 180, "args": ["-sV", "-sC", "-T4", "--open", "{target}"], "extra_args": []},
-    "whois": {"timeout": 30, "args": ["{target}"], "extra_args": []},
+    "wordlists": DEFAULT_WORDLISTS,
+    "nmap": {"timeout": 180, "args": ["-sV", "-sC", "-T4", "--open", "{host}"], "extra_args": []},
+    "whois": {"timeout": 30, "args": ["{host}"], "extra_args": []},
     "whatweb": {"timeout": 60, "args": ["-a", "3", "{target}"], "extra_args": []},
     "curl": {"timeout": 20, "args": ["-I", "--max-time", "10"], "extra_args": []},
     "dig": {"timeout": 15, "args": ["+short"], "extra_args": []},
     "nikto": {"timeout": 300, "args": ["-h", "{url}", "-ssl", "-nointeractive"], "extra_args": []},
     "gobuster": {
         "timeout": 300,
-        "wordlist": DEFAULT_WORDLIST,
+        "wordlist": "Discovery/Web-Content/big.txt",
         "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r", "-e"],
         "extra_args": [],
     },
     "arp-scan": {"timeout": 60, "args": ["--ignoredups", "{target}"], "extra_args": []},
-    "sslscan": {"timeout": 240, "args": ["--no-colour", "{target}"], "extra_args": []},
-    "testssl.sh": {"timeout": 300, "args": ["{target}"], "extra_args": []},
+    "sslscan": {"timeout": 240, "args": ["--no-colour", "{host}"], "extra_args": []},
+    "testssl.sh": {"timeout": 300, "args": ["{host}"], "extra_args": []},
     "katana": {"timeout": 180, "depth": 2, "args": ["-u", "{url}", "-d", "{depth}", "-jc"], "extra_args": []},
     "nuclei": {"timeout": 300, "args": ["-u", "{url}"], "extra_args": []},
     "httpx": {
@@ -76,7 +141,7 @@ DEFAULT_CONFIG = {
     },
     "ffuf": {
         "timeout": 300,
-        "wordlist": DEFAULT_WORDLIST,
+        "wordlist": "Discovery/Web-Content/directory-list-2.3-big.txt",
         "args": ["-u", "{url}/FUZZ", "-w", "{wordlist}"],
         "extra_args": [],
     },
@@ -93,7 +158,12 @@ DEFAULT_CONFIG = {
         "args": ["-u", "{url}", "-v", "2"],
         "extra_args": [],
     },
-    "dalfox": {"timeout": 300, "args": ["url", "{url}"], "extra_args": []},
+    "dalfox": {
+        "timeout": 300,
+        "wordlist": "Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
+        "args": ["url", "{url}", "--custom-payload", "{wordlist}"],
+        "extra_args": [],
+    },
     "commix": {
         "timeout": 600,
         "crawl": 2,
@@ -121,6 +191,26 @@ DEFAULT_CONFIG = {
         "headless": True,
         "allowed_hosts": [],
         "allow_subdomains": False,
+    },
+    "searchsploit": {
+        "timeout": 30,
+        "args": ["--colour", "disable", "--www"],
+        "extra_args": [],
+    },
+    "gau": {
+        "timeout": 180,
+        "args": ["{host}", "--subs"],
+        "extra_args": ["--blacklist", "png,jpg,gif,svg,woff,woff2,css,ico"],
+    },
+    "subfinder": {
+        "timeout": 120,
+        "args": ["-d", "{host}", "-silent"],
+        "extra_args": [],
+    },
+    "masscan": {
+        "timeout": 180,
+        "args": ["{target}", "-p1-65535", "--rate", "1000", "--wait", "3"],
+        "extra_args": [],
     },
 }
 
@@ -155,6 +245,95 @@ def _scheme_urls(target: str) -> tuple:
     return http_url, https_url
 
 
+def _hostname(target: str) -> str:
+    """Hostname or IP from a URL, host:port, or bare host — no scheme or path."""
+    raw = (target or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        return host.strip("[]")
+    host = raw.split("/")[0]
+    if host.startswith("[") and "]" in host:
+        return host[1:host.index("]")]
+    if host.count(":") == 1:
+        left, right = host.rsplit(":", 1)
+        if right.isdigit():
+            return left
+    return host
+
+
+def _is_ip(host: str) -> bool:
+    raw = (host or "").strip("[]")
+    if not raw:
+        return False
+    try:
+        ipaddress.ip_address(raw)
+        return True
+    except ValueError:
+        return False
+
+
+def _apex_host(target: str) -> str:
+    host = (_hostname(target) or "").lower().rstrip(".")
+    if host.startswith("www."):
+        return host[4:]
+    return host
+
+
+def is_domain_name(target: str) -> bool:
+    """True when the target is a DNS name (not an IP), suitable for subfinder/gau."""
+    host = _hostname(target)
+    if not host or _is_ip(host):
+        return False
+    if host.lower() in ("localhost",):
+        return False
+    return "." in host
+
+
+def _is_lan_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address((ip_str or "").strip("[]").split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+
+
+def lan_ips_for_target(target: str) -> tuple:
+    """
+    Resolve the target and return (ok, ips, reason).
+    ok is True only if every resolved address is RFC1918, loopback, or link-local.
+    Fails closed on DNS errors or any public address.
+    """
+    host = _hostname(target)
+    if not host:
+        return False, [], "empty host"
+    if _is_ip(host):
+        if _is_lan_ip(host):
+            return True, [host], ""
+        return False, [], f"{host} is not a LAN address"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError, UnicodeError) as exc:
+        return False, [], f"DNS failed: {exc}"
+    addrs = []
+    seen = set()
+    for info in infos:
+        addr = info[4][0]
+        if "%" in addr:
+            addr = addr.split("%", 1)[0]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        if not _is_lan_ip(addr):
+            return False, [], f"{host} resolves to public address {addr}"
+        addrs.append(addr)
+    if not addrs:
+        return False, [], f"no addresses for {host}"
+    return True, addrs, ""
+
+
 def load_tools_config(force: bool = False) -> dict:
     """Load tools_config.json, merged over in-code defaults."""
     global _config
@@ -172,6 +351,13 @@ def load_tools_config(force: bool = False) -> dict:
         for key, value in data.items():
             if key == "_global" and isinstance(value, dict):
                 merged["_global"].update(value)
+            elif key == "wordlists" and isinstance(value, dict):
+                bucket = merged.setdefault("wordlists", {})
+                for name, spec in value.items():
+                    if isinstance(spec, dict) and isinstance(bucket.get(name), dict):
+                        bucket[name].update(spec)
+                    else:
+                        bucket[name] = spec
             elif isinstance(value, dict):
                 merged.setdefault(key, {}).update(value)
             else:
@@ -200,20 +386,215 @@ def get_global_config() -> dict:
     return global_cfg if isinstance(global_cfg, dict) else {}
 
 
-def resolve_wordlist(cfg: dict) -> str:
-    configured = str(cfg.get("wordlist") or DEFAULT_WORDLIST)
-    if configured and Path(configured).is_file():
-        return configured
-    for candidate in WORDLIST_CANDIDATES:
-        if Path(candidate).is_file():
-            if configured and candidate != configured:
-                print(f"  [*] wordlist {configured} missing — using {candidate}")
+def _looks_like_seclists_root(path: str) -> bool:
+    root = Path(path)
+    return root.is_dir() and (root / "Discovery").is_dir()
+
+
+def detect_wordlists_root() -> str:
+    """Return the SecLists root, or '' if none is present."""
+    configured = str(get_global_config().get("wordlists_root") or "").strip()
+    if configured:
+        if _looks_like_seclists_root(configured):
+            return configured
+        if Path(configured).is_dir():
+            return configured
+    for candidate in SECLISTS_ROOT_CANDIDATES:
+        if _looks_like_seclists_root(candidate):
             return candidate
-    return configured
+    return ""
+
+
+def get_wordlist_scenarios() -> dict:
+    cfg = load_tools_config()
+    scenarios = cfg.get("wordlists") or {}
+    return scenarios if isinstance(scenarios, dict) else {}
+
+
+def list_wordlist_scenarios(tool: str = None) -> list:
+    names = []
+    for name, spec in get_wordlist_scenarios().items():
+        if not isinstance(spec, dict):
+            continue
+        allowed = spec.get("tools") or []
+        if tool and allowed and tool not in allowed:
+            continue
+        names.append(str(name).lower())
+    return names
+
+
+def get_scenario(name: str, tool: str = None):
+    """Return scenario spec if it exists and is allowed for this tool."""
+    key = (name or "").strip().lower()
+    if not key:
+        return None
+    spec = get_wordlist_scenarios().get(key)
+    if not isinstance(spec, dict):
+        return None
+    allowed = spec.get("tools") or []
+    if tool and allowed and tool not in allowed:
+        return None
+    return spec
+
+
+def _to_relative_wordlist(path: str) -> str:
+    raw = (path or "").replace("\\", "/").strip()
+    for prefix in WORDLIST_ABS_PREFIXES:
+        if raw.startswith(prefix):
+            rest = raw[len(prefix):]
+            if rest.startswith("Discovery/") or rest.startswith("Fuzzing/"):
+                return rest
+    return raw
+
+
+def _pick_txt_from_dir(directory: Path) -> str:
+    files = [
+        f for f in directory.iterdir()
+        if f.is_file()
+        and f.suffix.lower() == ".txt"
+        and f.name.lower() not in ("readme.txt", "license.txt")
+    ]
+    if not files:
+        return ""
+    lower = {f.name.lower(): f for f in files}
+    for pref in DIR_FILE_PREFS:
+        if pref.lower() in lower:
+            return str(lower[pref.lower()])
+    fuzz = sorted(f for f in files if f.name.lower().endswith(".fuzz.txt"))
+    if fuzz:
+        return str(fuzz[0])
+    return str(sorted(files, key=lambda f: f.name.lower())[0])
+
+
+def _file_from_candidate(path: str) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    if p.is_file():
+        return str(p)
+    if p.is_dir():
+        return _pick_txt_from_dir(p)
+    return ""
+
+
+def _expand_wordlist_path(path: str, root: str) -> list:
+    """Absolute path plus root-relative variants to try."""
+    raw = (path or "").strip()
+    if not raw:
+        return []
+    out = []
+    if Path(raw).is_absolute():
+        out.append(raw)
+        rel = _to_relative_wordlist(raw)
+        if rel != raw and root:
+            out.append(str(Path(root) / rel))
+    elif root:
+        out.append(str(Path(root) / raw))
+        out.append(raw)
+    else:
+        out.append(raw)
+    seen = set()
+    unique = []
+    for item in out:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def resolve_wordlist(cfg: dict, scenario: str = None, tool: str = None) -> str:
+    """
+    Resolve a wordlist file. Relative paths are joined to the detected
+    SecLists root. Named scenarios are allowlisted in tools_config.json.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    root = detect_wordlists_root()
+    candidates = []
+    key = (scenario or "").strip().lower()
+    if key:
+        spec = get_scenario(key, tool=tool)
+        if spec is None:
+            if get_wordlist_scenarios().get(key) is not None:
+                print(f"  [!] SCENARIO:{key} is not valid for {tool or 'this tool'} — using default wordlist")
+            else:
+                print(f"  [!] Unknown SCENARIO:{key} — using default wordlist")
+            key = ""
+        else:
+            for item in [spec.get("path"), *(spec.get("fallbacks") or [])]:
+                if item:
+                    candidates.extend(_expand_wordlist_path(str(item), root))
+    if not candidates:
+        configured = str(cfg.get("wordlist") or DEFAULT_WORDLIST)
+        candidates.extend(_expand_wordlist_path(configured, root))
+        if root:
+            candidates.extend(_expand_wordlist_path(DEFAULT_WORDLIST, root))
+        candidates.extend(DIRB_FALLBACKS)
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        found = _file_from_candidate(candidate)
+        if found:
+            configured = str(cfg.get("wordlist") or "")
+            if key:
+                print(f"  [*] wordlist scenario {key}: {found}")
+            elif configured and found != configured and not Path(configured).is_file():
+                print(f"  [*] wordlist {configured} missing — using {found}")
+            return found
+
+    fallback = candidates[0] if candidates else (cfg.get("wordlist") or DEFAULT_WORDLIST)
+    return str(fallback)
+
+
+def _ffuf_url_for_mode(target: str, mode: str) -> str:
+    url = _http_url(target)
+    parsed = urlparse(url)
+    mode = (mode or "path").lower()
+    if mode == "value":
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if pairs:
+            last_key, _ = pairs[-1]
+            pairs = list(pairs[:-1]) + [(last_key, "FUZZ")]
+            return urlunparse(parsed._replace(query=urlencode(pairs, doseq=True)))
+        return urlunparse(parsed._replace(query="q=FUZZ"))
+    if mode == "param":
+        return urlunparse(parsed._replace(query="FUZZ=1"))
+    return url
+
+
+def _strip_flag_and_value(command: list, flag: str) -> list:
+    out = []
+    skip = False
+    for arg in command:
+        if skip:
+            skip = False
+            continue
+        if arg == flag:
+            skip = True
+            continue
+        out.append(arg)
+    return out
+
+
+def _apply_ffuf_scenario(command: list, target: str, mode: str) -> list:
+    mode = (mode or "path").lower()
+    if mode == "path":
+        return command
+    out = list(command)
+    new_url = _ffuf_url_for_mode(target, mode)
+    try:
+        idx = out.index("-u")
+        out[idx + 1] = new_url
+    except (ValueError, IndexError):
+        pass
+    return _strip_flag_and_value(out, "-e")
 
 
 def substitute_args(args: list, target: str, cfg: dict, wordlist: str = None) -> list:
     url = _http_url(target)
+    host = _hostname(target)
     if wordlist is None:
         wordlist = resolve_wordlist(cfg)
     try:
@@ -225,6 +606,7 @@ def substitute_args(args: list, target: str, cfg: dict, wordlist: str = None) ->
     mapping = {
         "{target}": target,
         "{url}": url,
+        "{host}": host,
         "{wordlist}": wordlist,
         "{crawl}": crawl,
         "{depth}": depth,
@@ -238,13 +620,19 @@ def substitute_args(args: list, target: str, cfg: dict, wordlist: str = None) ->
     return out
 
 
-def build_command(binary: str, target: str, cfg: dict) -> list:
+def build_command(binary: str, target: str, cfg: dict, scenario: str = None, tool: str = None) -> list:
     """Build argv. Binary (argv[0]) is never taken from JSON args/extra_args."""
-    wordlist = resolve_wordlist(cfg)
+    logical = tool or Path(str(binary)).name
+    wordlist = resolve_wordlist(cfg, scenario=scenario, tool=logical)
     args = substitute_args(list(cfg.get("args") or []), target, cfg, wordlist=wordlist)
     extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg, wordlist=wordlist)
     prefix = [sys.executable, binary] if str(binary).endswith(".py") else [binary]
-    return prefix + args + extra
+    command = prefix + args + extra
+    if logical == "ffuf" and scenario:
+        spec = get_scenario(scenario, tool="ffuf")
+        if spec:
+            command = _apply_ffuf_scenario(command, target, spec.get("mode") or "path")
+    return command
 
 
 def _help_blob(binary: str) -> str:
@@ -294,6 +682,7 @@ def resolve_tool_binary(logical_name: str) -> str:
     httpx: prefer httpx-toolkit / Go install over the Python httpx CLI.
     sqlmap: prefer GitHub /opt/sqlmap or venv over outdated apt.
     commix: prefer GitHub /opt/commix over outdated apt.
+    searchsploit: prefer GitHub /opt/exploitdb over apt exploitdb.
     wapiti: prefer venv wapiti3 over apt 3.0.x.
     zaproxy: also try zap.sh / owasp-zap.
     Optional tools_config.json field "binary" overrides.
@@ -316,6 +705,12 @@ def resolve_tool_binary(logical_name: str) -> str:
         if go_httpx:
             return go_httpx
         return path_httpx or "httpx-toolkit"
+
+    if logical_name == "searchsploit":
+        for candidate in (Path("/usr/local/bin/searchsploit"), Path("/opt/exploitdb/searchsploit")):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return shutil.which("searchsploit") or "searchsploit"
 
     if logical_name == "sqlmap":
         for candidate in (Path("/usr/local/bin/sqlmap"), Path("/opt/sqlmap/sqlmap.py")):
@@ -354,6 +749,12 @@ def resolve_tool_binary(logical_name: str) -> str:
             return str(zap_sh)
         return "zaproxy"
 
+    found = shutil.which(logical_name)
+    if found:
+        return found
+    go = _go_bin(logical_name)
+    if go:
+        return go
     return logical_name
 
 
@@ -442,6 +843,11 @@ def start_results_dir(target: str) -> Path:
     _current_results_dir = path
     print(f"[+] Saving full tool logs to: {path}")
     return path
+
+
+def current_results_dir():
+    """Active scan_results/<target>/<stamp> directory, or None."""
+    return _current_results_dir
 
 
 def _truncate_log(text: str, max_lines: int) -> str:
@@ -552,6 +958,41 @@ def _zap_alert_summary(text: str) -> str:
     if not lines:
         return ""
     return "ZAP ALERTS:\n" + "\n".join(lines)
+
+
+def zap_report_path():
+    if _current_results_dir is None:
+        return None
+    path = _current_results_dir / "zaproxy_report.xml"
+    return path if path.is_file() else None
+
+
+def read_zap_report_xml() -> str:
+    path = zap_report_path()
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _attach_zap_report(body: str) -> str:
+    """Prefer on-disk quickout XML over stdout (progress bars / idle timeout)."""
+    xml = read_zap_report_xml()
+    source = xml or (body or "")
+    summary = _zap_alert_summary(source)
+    notices = []
+    for line in (body or "").splitlines():
+        if line.startswith("[!]"):
+            notices.append(line)
+    if summary:
+        print(summary)
+        prefix = ("\n".join(notices) + "\n") if notices else ""
+        return (prefix + summary).strip()
+    if xml:
+        return ((("\n".join(notices) + "\n") if notices else "") + xml).strip()
+    return body
 
 
 def _filter_live_output(tool_name: str, text: str, state: dict) -> str:
@@ -747,15 +1188,14 @@ def run_tool(
                     idle_reset=new_idle,
                     max_timeout=new_max,
                 )
+        if name == "zaproxy":
+            partial = _attach_zap_report(partial)
         return _truncate_log(partial, max_lines)
 
     if not body:
         body = "[!] Tool returned no output."
     if name == "zaproxy":
-        summary = _zap_alert_summary(body)
-        if summary:
-            print(summary)
-            body = summary
+        body = _attach_zap_report(body)
     return _truncate_log(body, max_lines)
 
 
@@ -926,11 +1366,12 @@ def run_dig(target: str) -> str:
     wordlist = resolve_wordlist(cfg)
     extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg, wordlist=wordlist)
     prefix = substitute_args(list(cfg.get("args") or ["+short"]), target, cfg, wordlist=wordlist)
-    print(f"  [*] dig {target} A/MX/NS/TXT")
+    host = _hostname(target) or target
+    print(f"  [*] dig {host} A/MX/NS/TXT")
     records = {}
     for rtype in ("A", "MX", "NS", "TXT"):
         records[rtype] = run_tool(
-            ["dig"] + prefix + extra + [rtype, target],
+            ["dig"] + prefix + extra + [rtype, host],
             timeout=timeout,
             tool_name="dig",
             allow_retry=True,
@@ -1034,6 +1475,89 @@ def run_playwright(target: str, allow_retry: bool = True) -> str:
     return run_tool(cmd, timeout=timeout, tool_name="playwright", allow_retry=allow_retry)
 
 
+def run_searchsploit(target: str) -> str:
+    """Exploit-DB search. TARGET is a product/version query, not a URL."""
+    query = (target or "").strip()
+    if not query:
+        return "[!] searchsploit needs a product/version query, not a URL."
+    if "://" in query:
+        msg = "[!] searchsploit skipped — TARGET must be a product/version query, not a URL."
+        print(msg)
+        return msg
+    terms = [t for t in query.split() if t]
+    if not terms:
+        return "[!] searchsploit needs a product/version query, not a URL."
+    cfg = get_tool_config("searchsploit")
+    timeout = int(cfg.get("timeout", 30) or 30)
+    argv0 = resolve_tool_binary("searchsploit")
+    wordlist = resolve_wordlist(cfg)
+    prefix = substitute_args(
+        list(cfg.get("args") or ["--colour", "disable", "--www"]),
+        query,
+        cfg,
+        wordlist=wordlist,
+    )
+    extra = substitute_args(list(cfg.get("extra_args") or []), query, cfg, wordlist=wordlist)
+    command = [argv0] + prefix + extra + terms
+    print(f"  [*] {' '.join(str(c) for c in command)}")
+    return run_tool(command, timeout=timeout, tool_name="searchsploit", allow_retry=True)
+
+
+def run_gau(target: str) -> str:
+    host = _apex_host(target)
+    if not host or _is_ip(host):
+        msg = "[!] gau skipped — target is an IP, not a domain."
+        print(msg)
+        return msg
+    return _run_configured("gau", host)
+
+
+def run_subfinder(target: str) -> str:
+    host = _apex_host(target)
+    if not host or _is_ip(host):
+        msg = "[!] subfinder skipped — target is an IP, not a domain."
+        print(msg)
+        return msg
+    return _run_configured("subfinder", host)
+
+
+def run_masscan(target: str) -> str:
+    ok, ips, reason = lan_ips_for_target(target)
+    if not ok:
+        msg = f"[!] masscan skipped — target is not on the local network ({reason})"
+        print(msg)
+        return msg
+    cfg = get_tool_config("masscan")
+    timeout = int(cfg.get("timeout", 180) or 180)
+    argv0 = resolve_tool_binary("masscan")
+    chunks = []
+    for ip in ips:
+        command = _finalize_command("masscan", build_command(argv0, ip, cfg), ip)
+        print(f"  [*] {' '.join(str(c) for c in command)}")
+        output = run_tool(
+            command,
+            timeout=timeout,
+            tool_name="masscan",
+            allow_retry=True,
+            idle_reset=bool(cfg.get("idle_reset")),
+            max_timeout=int(cfg.get("max_timeout") or 0),
+        )
+        blob = output or ""
+        if (
+            "Operation not permitted" in blob
+            or "You don't have permission" in blob
+            or "need to be root" in blob.lower()
+        ):
+            notice = "[!] masscan needs CAP_NET_RAW/root — treating as non-fatal."
+            print(notice)
+            blob = blob + "\n" + notice
+        if len(ips) == 1:
+            chunks.append(blob)
+        else:
+            chunks.append(f"[masscan {ip}]\n{blob}")
+    return "\n\n".join(chunks)
+
+
 # ─────────────────────────────────────────────
 # MAIN RECON PIPELINE
 # ─────────────────────────────────────────────
@@ -1060,6 +1584,10 @@ TOOLS_MENU = {
     "19": ("wpscan",        run_wpscan),
     "20": ("zaproxy",       run_zap),
     "21": ("playwright",    run_playwright),
+    "22": ("searchsploit",  run_searchsploit),
+    "23": ("gau",           run_gau),
+    "24": ("subfinder",     run_subfinder),
+    "25": ("masscan",       run_masscan),
 }
 
 # Config / log file keys for menu entries (curl headers → curl, dig DNS → dig)
@@ -1085,6 +1613,10 @@ MENU_CONFIG_KEYS = {
     "19": "wpscan",
     "20": "zaproxy",
     "21": "playwright",
+    "22": "searchsploit",
+    "23": "gau",
+    "24": "subfinder",
+    "25": "masscan",
 }
 
 DEFAULT_RECON_KEYS = ["1", "2", "3", "4", "5"]
@@ -1138,6 +1670,7 @@ INSTALL_CHECK_TOOLS = (
     "nmap", "whois", "whatweb", "curl", "dig", "nikto", "gobuster",
     "arp-scan", "sslscan", "testssl.sh", "katana", "nuclei", "httpx",
     "ffuf", "sqlmap", "wapiti", "dalfox", "commix", "wpscan", "zaproxy",
+    "searchsploit", "gau", "subfinder", "masscan",
 )
 
 
@@ -1201,15 +1734,29 @@ def playwright_status() -> tuple:
 
 
 def wordlist_status() -> tuple:
+    root = detect_wordlists_root()
+    if root:
+        common = Path(root) / "Discovery" / "Web-Content" / "common.txt"
+        if common.is_file():
+            return True, root
+        return True, f"{root} (Discovery/Web-Content/common.txt missing)"
     path = resolve_wordlist({})
     if path and Path(path).is_file():
         return True, path
-    return False, path or DEFAULT_WORDLIST
+    return False, "SecLists not found"
+
+
+def _wordlist_file_status(tool: str) -> tuple:
+    cfg = get_tool_config(tool)
+    path = resolve_wordlist(cfg, tool=tool)
+    if path and Path(path).is_file():
+        return True, path
+    return False, path or cfg.get("wordlist") or DEFAULT_WORDLIST
 
 
 def collect_install_status() -> list:
     """
-    Presence checks for scanners, Playwright, and the dirb wordlist.
+    Presence checks for scanners, Playwright, and SecLists wordlists.
     Each item: {group, name, ok, detail, hint}
     """
     rows = []
@@ -1233,10 +1780,26 @@ def collect_install_status() -> list:
     ok, detail = wordlist_status()
     rows.append({
         "group": "wordlist",
-        "name": "dirb common.txt",
+        "name": "SecLists",
         "ok": ok,
         "detail": detail,
-        "hint": "sudo apt install dirb",
+        "hint": TOOL_INSTALL_HINTS["seclists"],
+    })
+    ok, detail = _wordlist_file_status("gobuster")
+    rows.append({
+        "group": "wordlist",
+        "name": "gobuster wordlist",
+        "ok": ok,
+        "detail": detail,
+        "hint": TOOL_INSTALL_HINTS["seclists"],
+    })
+    ok, detail = _wordlist_file_status("ffuf")
+    rows.append({
+        "group": "wordlist",
+        "name": "ffuf wordlist",
+        "ok": ok,
+        "detail": detail,
+        "hint": TOOL_INSTALL_HINTS["seclists"],
     })
     java = shutil.which("java")
     rows.append({
@@ -1251,7 +1814,7 @@ def collect_install_status() -> list:
         "group": "runtime",
         "name": "go",
         "ok": bool(go),
-        "detail": go or "not on PATH (needed to install nuclei/katana/httpx/dalfox/ffuf)",
+        "detail": go or "not on PATH (needed to install nuclei/katana/httpx/dalfox/ffuf/gau/subfinder)",
         "hint": "sudo apt install golang-go",
     })
     return rows
@@ -1263,15 +1826,51 @@ ALLOWED_TOOLS = {
     "katana", "nuclei", "httpx", "httpx-toolkit", "ffuf", "sqlmap", "wapiti",
     "dalfox", "commix", "wpscan", "zaproxy",
     "playwright",
+    "searchsploit", "gau", "subfinder", "masscan",
 }
 
 
-def _extract_dispatch_target(parts: list) -> str:
-    """Last non-flag token after the binary — host or URL."""
-    for token in reversed(parts[1:]):
-        if not token.startswith("-"):
-            return token
+def _is_wordlist_tag(token: str) -> bool:
+    t = (token or "").strip()
+    return t.upper().startswith("SCENARIO:") or t.upper().startswith("WORDLIST:")
+
+
+def _sanitize_scenario_name(raw: str) -> str:
+    name = (raw or "").strip().lower()
+    if not name:
+        return ""
+    if "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        print(f"  [!] Ignoring filesystem path in SCENARIO — using default wordlist")
+        return ""
+    return name
+
+
+def _extract_dispatch_scenario(parts: list) -> str:
+    """Allowlisted SCENARIO:name / WORDLIST:name token from an AI TOOL tag."""
+    for token in parts[1:]:
+        match = WORDLIST_TAG_RE.match(token or "")
+        if match:
+            return _sanitize_scenario_name(match.group(1))
     return ""
+
+
+def _extract_dispatch_target(parts: list) -> str:
+    """Last non-flag, non-scenario token after the binary — host or URL."""
+    for token in reversed(parts[1:]):
+        if token.startswith("-") or _is_wordlist_tag(token):
+            continue
+        return token
+    return ""
+
+
+def _extract_searchsploit_query(parts: list) -> str:
+    """Join remaining non-flag tokens — searchsploit ANDs product + version terms."""
+    tokens = []
+    for token in parts[1:]:
+        if not token or token.startswith("-") or _is_wordlist_tag(token):
+            continue
+        tokens.append(token)
+    return " ".join(tokens)
 
 
 _JUNK_PATH_SEGMENTS = {
@@ -1298,6 +1897,7 @@ def run_tool_by_command(command_str: str) -> str:
     """
     AI dispatch: binary name is allowlisted; flags always come from
     tools_config.json. Extra flags the model invents are ignored.
+    Optional SCENARIO:name / WORDLIST:name selects an allowlisted wordlist.
     """
     parts = command_str.strip().split()
     if not parts:
@@ -1307,16 +1907,21 @@ def run_tool_by_command(command_str: str) -> str:
     if tool not in ALLOWED_TOOLS:
         return f"[!] Tool '{parts[0]}' is not permitted. Allowed: {ALLOWED_TOOLS}"
 
-    target = _extract_dispatch_target(parts)
+    scenario = _extract_dispatch_scenario(parts)
+    if tool == "searchsploit":
+        target = _extract_searchsploit_query(parts)
+    else:
+        target = _extract_dispatch_target(parts)
     if not target:
         return f"[!] No target in command. Use: [TOOL: {tool} TARGET]"
-    cleaned = _sanitize_dispatch_target(target)
-    if cleaned != target:
-        print(f"  [!] Stripped junk path from TARGET: {target} → {cleaned}")
-        target = cleaned
+    if tool != "searchsploit":
+        cleaned = _sanitize_dispatch_target(target)
+        if cleaned != target:
+            print(f"  [!] Stripped junk path from TARGET: {target} → {cleaned}")
+            target = cleaned
 
-    extra_from_model = len(parts) > 2
-    if extra_from_model:
+    invented_flags = [p for p in parts[1:] if p.startswith("-")]
+    if invented_flags:
         print(f"  [*] Ignoring model flags; using {CONFIG_PATH.name} for {tool}")
 
     if tool == "playwright":
@@ -1325,12 +1930,24 @@ def run_tool_by_command(command_str: str) -> str:
         return run_curl_headers(target)
     if tool == "dig":
         return run_dig(target)
+    if tool == "searchsploit":
+        return run_searchsploit(target)
+    if tool == "gau":
+        return run_gau(target)
+    if tool == "subfinder":
+        return run_subfinder(target)
+    if tool == "masscan":
+        return run_masscan(target)
 
     config_key = "httpx" if tool == "httpx-toolkit" else tool
     cfg = get_tool_config(config_key)
     timeout = int(cfg.get("timeout", 120) or 120)
     argv0 = resolve_tool_binary(config_key)
-    command = _finalize_command(config_key, build_command(argv0, target, cfg), target)
+    command = _finalize_command(
+        config_key,
+        build_command(argv0, target, cfg, scenario=scenario, tool=config_key),
+        target,
+    )
     joined = " ".join(str(c) for c in command)
     if target not in joined and _http_url(target) not in joined:
         command.append(target)

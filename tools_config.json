@@ -2,16 +2,70 @@
   "_global": {
     "max_log_lines": 2000,
     "timeout_retry_multiplier": 2,
-    "results_dir": "scan_results"
+    "results_dir": "scan_results",
+    "wordlists_root": ""
+  },
+  "wordlists": {
+    "wordpress": {
+      "path": "Discovery/Web-Content/CMS/wordpress.fuzz.txt",
+      "tools": ["gobuster", "ffuf"],
+      "mode": "path"
+    },
+    "api": {
+      "path": "Discovery/Web-Content/api/api-endpoints.txt",
+      "tools": ["gobuster", "ffuf"],
+      "mode": "path"
+    },
+    "backups": {
+      "path": "Discovery/Web-Content/Common-DB-Backups.txt",
+      "tools": ["gobuster", "ffuf"],
+      "mode": "path"
+    },
+    "sqli": {
+      "path": "Fuzzing/Databases/SQLi/Generic-SQLi.txt",
+      "fallbacks": ["Fuzzing/SQLi/Generic-SQLi.txt"],
+      "tools": ["ffuf"],
+      "mode": "value"
+    },
+    "xss": {
+      "path": "Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
+      "tools": ["ffuf", "dalfox"],
+      "mode": "value"
+    },
+    "parameters": {
+      "path": "Discovery/Web-Content/burp-parameter-names.txt",
+      "tools": ["ffuf"],
+      "mode": "param"
+    },
+    "raft-large": {
+    "path": "Discovery/Web-Content/raft-large-directories.txt",
+    "tools": ["gobuster", "ffuf"],
+    "mode": "path"
+    },
+    "subdomains": {
+      "path": "Discovery/DNS/subdomains-top1million-5000.txt",
+      "tools": ["gobuster"],
+      "mode": "domain"
+    },
+    "lfi": {
+      "path": "Fuzzing/LFI/Generic-LFI.txt",
+      "tools": ["ffuf"],
+      "mode": "value"
+    },
+    "rfi": {
+      "path": "Fuzzing/RFI/Generic-RFI.txt",
+      "tools": ["ffuf"],
+      "mode": "value"
+    }
   },
   "nmap": {
     "timeout": 180,
-    "args": ["-sV", "-sC", "-T4", "--open", "{target}"],
+    "args": ["-sV", "-sC", "-T4", "--open", "{host}"],
     "extra_args": []
   },
   "whois": {
     "timeout": 30,
-    "args": ["{target}"],
+    "args": ["{host}"],
     "extra_args": []
   },
   "whatweb": {
@@ -31,13 +85,13 @@
   },
   "nikto": {
     "timeout": 600,
-    "args": ["-h", "{url}", "-ssl", "-nointeractive"],
-    "extra_args": []
+    "args": ["-h", "{url}", "-ssl", "-nointeractive", "-Format", "html", "-o", "nikto_report.html"],
+    "extra_args": ["-Tuning", "1234567890abcde"]
   },
   "gobuster": {
-    "timeout": 300,
-    "wordlist": "/usr/share/wordlists/dirb/common.txt",
-    "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r", "-e"],
+    "timeout": 600,
+    "wordlist": "Discovery/Web-Content/raft-large-directories.txt",
+    "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r", "-e", "-t", "50", "-x", "php,html,txt,js,json,xml,bak,old,sql"],
     "extra_args": []
   },
   "arp-scan": {
@@ -47,24 +101,24 @@
   },
   "sslscan": {
     "timeout": 240,
-    "args": ["--no-colour", "{target}"],
+    "args": ["--no-colour", "{host}"],
     "extra_args": []
   },
   "testssl.sh": {
-    "timeout": 300,
-    "args": ["{target}"],
+    "timeout": 600,
+    "args": ["{host}", "--full", "--color", "0", "--jsonfile", "testssl.json"],
     "extra_args": []
   },
   "katana": {
-    "timeout": 180,
-    "depth": 2,
-    "args": ["-u", "{url}", "-d", "{depth}", "-jc"],
+    "timeout": 300,
+    "depth": 5,
+    "args": ["-u", "{url}", "-d", "{depth}", "-jc", "-kf", "-fx", "-ef", "jpg,png,gif,svg,mp4,webm,woff,woff2,css", "-af", "url,js,css"],
     "extra_args": []
   },
   "nuclei": {
-    "timeout": 300,
-    "args": ["-u", "{url}"],
-    "extra_args": []
+    "timeout": 600,
+    "args": ["-u", "{url}", "-severity", "critical,high,medium,low", "-tags", "cve,default-login,exposure,file,config,security-misconfiguration,ssl,tech,wordpress", "-rate-limit", "150"],
+    "extra_args": ["-stats", "-si", "50"]
   },
   "httpx": {
     "timeout": 60,
@@ -72,57 +126,60 @@
     "extra_args": []
   },
   "ffuf": {
-    "timeout": 300,
-    "wordlist": "/usr/share/dirb/wordlists/common.txt",
-    "args": ["-u", "{url}/FUZZ", "-w", "{wordlist}"],
-    "extra_args": []
+    "timeout": 600,
+    "wordlist": "Discovery/Web-Content/directory-list-2.3-big.txt",
+    "args": ["-u", "{url}/FUZZ", "-w", "{wordlist}", "-t", "50", "-fs", "0", "-ac", "-e", ".php,.html,.txt,.js,.json,.xml,.bak,.old,.sql,.inc,.config,.env"],
+    "extra_args": ["-fc", "404,403"]
   },
   "sqlmap": {
     "timeout": 600,
-    "crawl": 1,
-    "args": ["-u", "{url}", "--batch", "--crawl={crawl}"],
-    "extra_args": []
+    "crawl": 3,
+    "args": ["-u", "{url}", "--batch", "--crawl={crawl}", "--level=5", "--risk=3", "--random-agent", "--threads=10", "--tamper=space2comment,randomcase"],
+    "extra_args": ["--os-shell"]
   },
   "wapiti": {
-    "timeout": 120,
+    "timeout": 600,
     "idle_reset": true,
-    "max_timeout": 3600,
-    "args": ["-u", "{url}", "-v", "2"],
+    "max_timeout": 5600,
+    "args": ["-u", "{url}", "-v", "2", "-m", "all", "--flush-session", "--scope", "domain"],
     "extra_args": []
   },
   "dalfox": {
     "timeout": 300,
-    "args": ["url", "{url}"],
+    "wordlist": "Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
+    "args": ["url", "{url}", "--verbose", "--mass", "--silence", "--custom-payload", "{wordlist}"],
     "extra_args": []
   },
   "commix": {
     "timeout": 600,
-    "crawl": 2,
-    "args": ["--url", "{url}", "--batch", "--crawl={crawl}"],
-    "extra_args": []
+    "crawl": 3,
+    "args": ["--url", "{url}", "--batch", "--crawl={crawl}", "--level=3", "--risk=3", "--cmd-delay=1", "--random-agent", "--force-ssl"],
+    "extra_args": ["--os-cmd=whoami"]
   },
   "wpscan": {
-    "timeout": 300,
-    "args": ["--url", "{url}"],
+    "timeout": 600,
+    "args": ["--url", "{url}", "--enumerate", "vp,vt,tt,cb,dbe,u,m", "--plugins-detection", "mixed", "--random-user-agent"],
     "extra_args": []
   },
   "zaproxy": {
     "timeout": 120,
     "idle_reset": true,
-    "max_timeout": 3600,
+    "max_timeout": 5600,
     "args": [
       "-cmd",
       "-quickurl",
       "{url}",
       "-quickprogress",
       "-config",
-      "spider.maxChildren=10",
+      "spider.maxChildren=50",
       "-config",
-      "spider.maxDepth=2",
+      "spider.maxDepth=10",
       "-config",
-      "spider.maxDuration=5",
+      "spider.maxDuration=30",
       "-config",
-      "scanner.threadPerHost=2"
+      "scanner.threadPerHost=5",
+      "-config",
+      "scanner.maxRuleDurationInMins=10"
     ],
     "extra_args": []
   },
@@ -133,5 +190,25 @@
     "headless": true,
     "allowed_hosts": [],
     "allow_subdomains": false
+  },
+  "searchsploit": {
+    "timeout": 30,
+    "args": ["--colour", "disable", "--www"],
+    "extra_args": []
+  },
+  "gau": {
+    "timeout": 180,
+    "args": ["{host}", "--subs"],
+    "extra_args": ["--blacklist", "png,jpg,gif,svg,woff,woff2,css,ico"]
+  },
+  "subfinder": {
+    "timeout": 120,
+    "args": ["-d", "{host}", "-silent"],
+    "extra_args": []
+  },
+  "masscan": {
+    "timeout": 180,
+    "args": ["{target}", "-p1-65535", "--rate", "1000", "--wait", "3"],
+    "extra_args": []
   }
 }
