@@ -139,6 +139,9 @@ def handle_search_dispatch(query: str) -> str:
     if cve_match:
         return search_cve(cve_match.group())
 
+    if re.match(r"CVE[\s:=_-]", query, re.IGNORECASE) or query.lower().startswith("cve"):
+        return f"[!] Skipping SEARCH — not a CVE id: {query}"
+
     # exploit keywords
     if any(word in query.lower() for word in ["exploit", "poc", "payload", "rce", "lfi", "sqli"]):
         return web_search(query + " exploit poc github", max_results=5)

@@ -20,7 +20,8 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
 
-CONFIG_PATH = Path(__file__).parent / "tools_config.json"
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_ROOT / "tools_config.json"
 
 TOOL_INSTALL_HINTS = {
     "katana": "go install -v github.com/projectdiscovery/katana/cmd/katana@latest",
@@ -54,9 +55,9 @@ DEFAULT_CONFIG = {
     "nmap": {"timeout": 180, "args": ["-sV", "-sC", "-T4", "--open", "{target}"], "extra_args": []},
     "whois": {"timeout": 30, "args": ["{target}"], "extra_args": []},
     "whatweb": {"timeout": 60, "args": ["-a", "3", "{target}"], "extra_args": []},
-    "curl": {"timeout": 20, "args": ["-I", "--max-time", "10", "--location"], "extra_args": []},
+    "curl": {"timeout": 20, "args": ["-I", "--max-time", "10"], "extra_args": []},
     "dig": {"timeout": 15, "args": ["+short"], "extra_args": []},
-    "nikto": {"timeout": 300, "args": ["-h", "{target}", "-nointeractive"], "extra_args": []},
+    "nikto": {"timeout": 300, "args": ["-h", "{url}", "-ssl", "-nointeractive"], "extra_args": []},
     "gobuster": {
         "timeout": 300,
         "wordlist": DEFAULT_WORDLIST,
@@ -418,11 +419,25 @@ def sanitize_target(target: str) -> str:
     return (text[:80] or "target").strip("._") or "target"
 
 
+def resolve_results_root() -> Path:
+    """Resolve scan_results against the project directory, not process CWD."""
+    root = str(get_global_config().get("results_dir", "scan_results") or "scan_results")
+    path = Path(root).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def reports_dir() -> Path:
+    path = PROJECT_ROOT / "reports"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def start_results_dir(target: str) -> Path:
     global _current_results_dir
-    root = get_global_config().get("results_dir", "scan_results")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = Path(root) / sanitize_target(target) / stamp
+    path = resolve_results_root() / sanitize_target(target) / stamp
     path.mkdir(parents=True, exist_ok=True)
     _current_results_dir = path
     print(f"[+] Saving full tool logs to: {path}")
@@ -466,22 +481,33 @@ def _probe_version(binary: str) -> str:
             lower = blob.lower()
             if "unknown flag" in lower or "unknown option" in lower:
                 continue
-            lines = []
-            for ln in blob.splitlines():
-                text = ln.strip()
-                if not text:
-                    continue
-                if text.lower().startswith("error:"):
-                    continue
-                lines.append(text)
-            if lines:
-                summary = " | ".join(lines[:3])
+            summary = _version_summary(blob)
+            if summary:
                 _version_cache[binary] = summary
                 print(f"  [version] {binary}: {summary}")
                 return summary
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
     _version_cache[binary] = ""
+    return ""
+
+
+def _version_summary(blob: str) -> str:
+    """Pick a short version line; skip ASCII-art banners."""
+    art = re.compile(r"[█░▓▒▄▀━_/\\\\|`]{8,}")
+    candidates = []
+    for ln in (blob or "").splitlines():
+        text = ln.strip()
+        if not text or len(text) > 160:
+            continue
+        if text.lower().startswith("error:"):
+            continue
+        if art.search(text) or text.count("_") > 12:
+            continue
+        if re.search(r"\d+\.\d+", text):
+            candidates.append(text)
+    if candidates:
+        return " | ".join(candidates[:2])
     return ""
 
 
@@ -496,9 +522,56 @@ def _append_log_file(tool_name: str, text: str) -> None:
                 fh.write("\n")
 
 
-# ─────────────────────────────────────────────
-# BASE RUNNER
-# ─────────────────────────────────────────────
+ZAP_PROGRESS_RE = re.compile(r"^\s*\[[=\s]*\]\s*\d+%")
+
+
+def _zap_alert_summary(text: str) -> str:
+    if "<alertitem>" not in (text or "").lower() and "<OWASPZAPReport" not in (text or ""):
+        return ""
+    lines = []
+    for block in re.findall(r"<alertitem>(.*?)</alertitem>", text or "", re.S | re.I):
+        alert = ""
+        risk = ""
+        uri = ""
+        am = re.search(r"<alert>([^<]*)</alert>", block, re.I)
+        nm = re.search(r"<name>([^<]*)</name>", block, re.I)
+        rm = re.search(r"<riskdesc>([^<]*)</riskdesc>", block, re.I)
+        um = re.search(r"<uri>([^<]+)</uri>", block, re.I)
+        if am:
+            alert = am.group(1).strip()
+        elif nm:
+            alert = nm.group(1).strip()
+        if rm:
+            risk = rm.group(1).strip()
+        if um:
+            uri = um.group(1).strip()
+        if alert:
+            lines.append(f"ZAP: {alert} | {risk} | {uri}")
+        if len(lines) >= 30:
+            break
+    if not lines:
+        return ""
+    return "ZAP ALERTS:\n" + "\n".join(lines)
+
+
+def _filter_live_output(tool_name: str, text: str, state: dict) -> str:
+    """Collapse CR progress updates; hide ZAP XML and percentage bars from the console."""
+    text = (text or "").replace("\r", "\n")
+    if tool_name != "zaproxy":
+        return text
+    if state.get("xml"):
+        return ""
+    out = []
+    for line in text.splitlines(keepends=True):
+        if "<?xml" in line or "<OWASPZAPReport" in line:
+            state["xml"] = True
+            continue
+        if state.get("xml"):
+            continue
+        if ZAP_PROGRESS_RE.search(line):
+            continue
+        out.append(line)
+    return "".join(out)
 
 def _wait_process(proc, timeout: int, idle_reset: bool, max_timeout: int, activity: dict) -> bool:
     """
@@ -567,6 +640,7 @@ def run_tool(
     proc = None
     activity = {"t": time.monotonic()}
     started = time.monotonic()
+    live_state = {"xml": False}
 
     try:
         proc = subprocess.Popen(
@@ -587,7 +661,9 @@ def run_tool(
                     break
                 activity["t"] = time.monotonic()
                 text = chunk.decode("utf-8", errors="replace")
-                print(text, end="", flush=True)
+                console_text = _filter_live_output(name, text, live_state)
+                if console_text:
+                    print(console_text, end="", flush=True)
                 captured.append(text)
                 _append_log_file(name, text)
 
@@ -675,6 +751,11 @@ def run_tool(
 
     if not body:
         body = "[!] Tool returned no output."
+    if name == "zaproxy":
+        summary = _zap_alert_summary(body)
+        if summary:
+            print(summary)
+            body = summary
     return _truncate_log(body, max_lines)
 
 
@@ -683,10 +764,64 @@ GOBUSTER_WILDCARD_RE = re.compile(
     re.IGNORECASE,
 )
 GOBUSTER_LENGTH_RE = re.compile(r"\(Length:\s*(\d+)\)", re.IGNORECASE)
+RESPONSE_SIZE_RE = re.compile(r"\[Size:\s*(\d+)\]", re.IGNORECASE)
+
+
+def _dominant_response_size(output: str, min_hits: int = 8) -> str:
+    sizes = RESPONSE_SIZE_RE.findall(output or "")
+    if len(sizes) < min_hits:
+        return ""
+    counts = {}
+    for size in sizes:
+        counts[size] = counts.get(size, 0) + 1
+    size, n = max(counts.items(), key=lambda kv: kv[1])
+    if n >= min_hits and n / len(sizes) >= 0.5:
+        return size
+    return ""
+
+
+def _retry_gobuster_wildcard(output: str, command: list, timeout: int) -> str:
+    if "--exclude-length" in command:
+        return output
+    length = ""
+    if GOBUSTER_WILDCARD_RE.search(output or ""):
+        match = GOBUSTER_LENGTH_RE.search(output or "")
+        if match:
+            length = match.group(1)
+    if not length:
+        length = _dominant_response_size(output)
+    if not length:
+        return output
+    retry_cmd = list(command) + ["--exclude-length", length]
+    print(f"  [*] gobuster catch-all size {length} — retrying with --exclude-length {length}")
+    print(f"  [*] {' '.join(str(c) for c in retry_cmd)}")
+    retry_out = run_tool(retry_cmd, timeout=timeout, tool_name="gobuster", allow_retry=False)
+    return (output or "") + f"\n\n[retry --exclude-length {length}]\n" + retry_out
+
+
+def _retry_ffuf_filter(output: str, command: list, timeout: int) -> str:
+    if "-fs" in command:
+        return output
+    size = _dominant_response_size(output)
+    if not size:
+        return output
+    retry_cmd = list(command) + ["-fs", size]
+    print(f"  [*] ffuf catch-all size {size} — retrying with -fs {size}")
+    print(f"  [*] {' '.join(str(c) for c in retry_cmd)}")
+    retry_out = run_tool(retry_cmd, timeout=timeout, tool_name="ffuf", allow_retry=False)
+    return (output or "") + f"\n\n[retry -fs {size}]\n" + retry_out
 
 
 def _finalize_command(logical_name: str, command: list, target: str) -> list:
     command = list(command)
+    if logical_name == "nikto":
+        url = _http_url(target)
+        if url.startswith("https://") and "-ssl" not in command:
+            command.append("-ssl")
+    if logical_name == "zaproxy" and _current_results_dir is not None:
+        out = str(_current_results_dir / "zaproxy_report.xml")
+        if "-quickout" not in command:
+            command.extend(["-quickout", out])
     if logical_name == "commix":
         url = _http_url(target)
         if url.startswith("https://") and "--force-ssl" not in command:
@@ -699,9 +834,14 @@ def _finalize_command(logical_name: str, command: list, target: str) -> list:
     if logical_name == "sqlmap":
         raw = target if target.startswith(("http://", "https://")) else _http_url(target)
         parsed = urlparse(raw)
+        weak = {
+            "unique", "v", "ver", "version", "cb", "cache", "nocache", "_",
+        }
         keys = []
         for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
-            if key and key not in keys:
+            if not key or key.lower() in weak or key.lower().startswith("utm_"):
+                continue
+            if key not in keys:
                 keys.append(key)
         if keys:
             if "-p" not in command:
@@ -709,22 +849,6 @@ def _finalize_command(logical_name: str, command: list, target: str) -> list:
         elif "--forms" not in command:
             command.append("--forms")
     return command
-
-
-def _retry_gobuster_wildcard(output: str, command: list, timeout: int) -> str:
-    if not GOBUSTER_WILDCARD_RE.search(output or ""):
-        return output
-    if "--exclude-length" in command:
-        return output
-    match = GOBUSTER_LENGTH_RE.search(output or "")
-    if not match:
-        return output
-    length = match.group(1)
-    retry_cmd = list(command) + ["--exclude-length", length]
-    print(f"  [*] gobuster wildcard length {length} — retrying with --exclude-length {length}")
-    print(f"  [*] {' '.join(str(c) for c in retry_cmd)}")
-    retry_out = run_tool(retry_cmd, timeout=timeout, tool_name="gobuster", allow_retry=False)
-    return (output or "") + f"\n\n[retry --exclude-length {length}]\n" + retry_out
 
 
 def _run_configured(binary: str, target: str, allow_retry: bool = True) -> str:
@@ -743,6 +867,8 @@ def _run_configured(binary: str, target: str, allow_retry: bool = True) -> str:
     )
     if binary == "gobuster":
         output = _retry_gobuster_wildcard(output, command, timeout)
+    if binary == "ffuf":
+        output = _retry_ffuf_filter(output, command, timeout)
     return output
 
 
@@ -768,7 +894,7 @@ def run_curl_headers(target: str) -> str:
     timeout = int(cfg.get("timeout", 20) or 20)
     wordlist = resolve_wordlist(cfg)
     base_args = substitute_args(
-        list(cfg.get("args") or ["-I", "--max-time", "10", "--location"]),
+        list(cfg.get("args") or ["-I", "--max-time", "10"]),
         target,
         cfg,
         wordlist=wordlist,
@@ -826,7 +952,12 @@ def run_gobuster(target: str) -> str:
 
 
 def run_arp_scan(target: str) -> str:
-    return _run_configured("arp-scan", target)
+    output = _run_configured("arp-scan", target)
+    if "Operation not permitted" in output or "You don't have permission" in output:
+        notice = "[!] arp-scan needs CAP_NET_RAW/root — treating as non-fatal."
+        print(notice)
+        return output + "\n" + notice
+    return output
 
 
 def run_sslscan(target: str) -> str:
@@ -1143,6 +1274,26 @@ def _extract_dispatch_target(parts: list) -> str:
     return ""
 
 
+_JUNK_PATH_SEGMENTS = {
+    "fullpath", "fuzz", "fu", "path", "url", "target", "endpoint", "endpoints",
+}
+
+
+def _sanitize_dispatch_target(target: str) -> str:
+    """Drop invented path tokens like /fullpath so ffuf/gobuster stay on origin."""
+    raw = (target or "").strip()
+    if not raw:
+        return raw
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    last = (parsed.path or "").rstrip("/").split("/")[-1].lower()
+    if last in _JUNK_PATH_SEGMENTS:
+        host = parsed.netloc or parsed.path.split("/")[0]
+        if parsed.scheme and host:
+            return f"{parsed.scheme}://{host}"
+        return host
+    return raw
+
+
 def run_tool_by_command(command_str: str) -> str:
     """
     AI dispatch: binary name is allowlisted; flags always come from
@@ -1159,6 +1310,10 @@ def run_tool_by_command(command_str: str) -> str:
     target = _extract_dispatch_target(parts)
     if not target:
         return f"[!] No target in command. Use: [TOOL: {tool} TARGET]"
+    cleaned = _sanitize_dispatch_target(target)
+    if cleaned != target:
+        print(f"  [!] Stripped junk path from TARGET: {target} → {cleaned}")
+        target = cleaned
 
     extra_from_model = len(parts) > 2
     if extra_from_model:
@@ -1190,6 +1345,8 @@ def run_tool_by_command(command_str: str) -> str:
     )
     if config_key == "gobuster":
         output = _retry_gobuster_wildcard(output, command, timeout)
+    if config_key == "ffuf":
+        output = _retry_ffuf_filter(output, command, timeout)
     return output
 
 

@@ -21,7 +21,7 @@
   },
   "curl": {
     "timeout": 20,
-    "args": ["-I", "--max-time", "10", "--location"],
+    "args": ["-I", "--max-time", "10"],
     "extra_args": []
   },
   "dig": {
@@ -30,8 +30,8 @@
     "extra_args": []
   },
   "nikto": {
-    "timeout": 300,
-    "args": ["-h", "{target}", "-nointeractive"],
+    "timeout": 600,
+    "args": ["-h", "{url}", "-ssl", "-nointeractive"],
     "extra_args": []
   },
   "gobuster": {
@@ -78,7 +78,7 @@
     "extra_args": []
   },
   "sqlmap": {
-    "timeout": 420,
+    "timeout": 600,
     "crawl": 1,
     "args": ["-u", "{url}", "--batch", "--crawl={crawl}"],
     "extra_args": []

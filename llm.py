@@ -7,7 +7,7 @@ Model: metatron-qwen (fine-tuned from huihui_ai/qwen3.5-abliterated:9b)
 """
 
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
@@ -29,7 +29,7 @@ SCANNER_ORDER = (
     "katana", "gobuster", "nuclei", "playwright", "zaproxy", "wapiti", "wpscan",
 )
 DISCOVERY_ORDER = ("katana", "gobuster", "nuclei", "playwright")
-OPTIONAL_SCANNERS = ("zaproxy", "wapiti", "wpscan")
+OPTIONAL_SCANNERS = ("zaproxy", "wapiti")
 INJECTION_TOOLS = ("sqlmap", "dalfox", "commix")
 MAX_TOOLS_PER_ROUND = 2
 
@@ -63,6 +63,21 @@ MAX_DISCOVERED_URLS = 40
 MAX_EVIDENCE_CHARS = 12000
 SHORT_OUTPUT = 800
 TAIL_LINES = 20
+JUNK_PATH_SEGMENTS = {
+    "fullpath", "fuzz", "fu", "path", "url", "target", "endpoint", "endpoints",
+}
+WEAK_QUERY_KEYS = {
+    "unique", "v", "ver", "version", "cb", "cache", "nocache", "_", "utm_source",
+    "utm_medium", "utm_campaign", "utm_content", "utm_term",
+}
+CATCHALL_SIZE_HITS = 8
+ERROR_REPLY_PREFIXES = (
+    "[!] Model returned empty response.",
+    "[!] Cannot connect to Ollama",
+    "[!] Ollama timed out",
+    "[!] Ollama HTTP error",
+    "[!] Unexpected error:",
+)
 
 # ─────────────────────────────────────────────
 # SYSTEM PROMPT
@@ -77,11 +92,13 @@ You drive real tools with tags. Flags always come from tools_config.json.
   [SEARCH: CVE-2026-33017]           → DuckDuckGo lookup
 
 Rules for tags:
-- Write ONLY [TOOL: <name> <TARGET>] or [SEARCH: <query>].
+- Write ONLY [TOOL: <name> <TARGET>] or [SEARCH: CVE-YYYY-NNNN].
+- SEARCH must be a real CVE id (CVE-2024-1234), never a site path.
 - TARGET may be the session host OR any discovered same-host URL
   (example: [TOOL: dalfox https://example.com/search?q=test]).
 - Do not invent flags (-sV, -u, --batch, -silent, YAML, nuclei templates).
-- Extra flags are ignored. To change paths, change TARGET only.
+- Do not invent paths like /fullpath. Extra flags are ignored.
+- To change paths, change TARGET only.
 
 Allowed tool names:
   nmap, whois, whatweb, curl, dig, nikto, gobuster, arp-scan, sslscan, testssl.sh,
@@ -91,12 +108,15 @@ How to use them:
 - katana/gobuster first on a web target to collect paths.
 - Then retarget sqlmap, dalfox, and commix at URLs with query strings or API paths
   from DISCOVERED_URLS. Do not keep scanning only the origin homepage.
+- Skip catch-all SPA paths that all return the same homepage size.
 - nuclei/wapiti/zaproxy: origin or interesting paths.
 - curl: fetch a specific evidence URL (headers). Use this for Nuclei hit URLs.
 - [SEARCH: CVE-…] for every CVE that appears in tool output BEFORE you treat it as a finding.
 - playwright: browser clicks. Cookie banners are probe blockers, not vulnerabilities.
+- wpscan only if the target is WordPress.
 
-Do not write VULN:/EXPLOIT:/RISK_LEVEL in tool rounds. A later finalize pass does that.
+During tool rounds write tags only. When the checklist is complete, write the
+VULN:/EXPLOIT:/RISK_LEVEL schema in plain text (same format as original METATRON).
 
 Accuracy:
 - nmap filtered or no-response is INCONCLUSIVE, not vulnerable.
@@ -136,34 +156,39 @@ Rules:
 # OLLAMA API CALL
 # ─────────────────────────────────────────────
 
-def ask_ollama(messages: list, temperature: float = ANALYSIS_TEMPERATURE) -> str:
-    try:
-        payload = {
-            "model": MODEL_NAME,
-            "messages": messages,
-            "stream": False,
-            "options": {
-                "num_predict": MAX_TOKENS,
-                "temperature": temperature,
-                "top_p": 0.9,
-            },
-        }
-        print(f"\n[*] Sending to {MODEL_NAME}...")
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        response = data.get("message", {}).get("content", "").strip()
-        if not response:
-            return "[!] Model returned empty response."
-        return response
-    except requests.exceptions.ConnectionError:
-        return "[!] Cannot connect to Ollama. Is it running? Try: ollama serve"
-    except requests.exceptions.Timeout:
-        return "[!] Ollama timed out. Model may be loading, try again."
-    except requests.exceptions.HTTPError as e:
-        return f"[!] Ollama HTTP error: {e}"
-    except Exception as e:
-        return f"[!] Unexpected error: {e}"
+def ask_ollama(messages: list, temperature: float = ANALYSIS_TEMPERATURE, retries: int = 1) -> str:
+    last = "[!] Model returned empty response."
+    for attempt in range(max(retries, 0) + 1):
+        try:
+            payload = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "num_predict": MAX_TOKENS,
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                },
+            }
+            print(f"\n[*] Sending to {MODEL_NAME}...")
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            response = data.get("message", {}).get("content", "").strip()
+            if response:
+                return response
+            last = "[!] Model returned empty response."
+        except requests.exceptions.ConnectionError:
+            return "[!] Cannot connect to Ollama. Is it running? Try: ollama serve"
+        except requests.exceptions.Timeout:
+            last = "[!] Ollama timed out. Model may be loading, try again."
+        except requests.exceptions.HTTPError as e:
+            last = f"[!] Ollama HTTP error: {e}"
+        except Exception as e:
+            last = f"[!] Unexpected error: {e}"
+        if attempt < retries:
+            print("[*] Empty or failed model reply — retrying...")
+    return last
 
 
 # ─────────────────────────────────────────────
@@ -246,6 +271,74 @@ def _is_static_asset(url: str) -> bool:
     return bool(STATIC_EXT_RE.search(path))
 
 
+def _path_last_segment(url: str) -> str:
+    parsed = _parse_url(url) or _parse_url(_http_url(url))
+    if parsed is None:
+        return (url or "").rstrip("/").split("/")[-1].lower()
+    return (parsed.path or "").rstrip("/").split("/")[-1].lower()
+
+
+def _is_junk_target(target: str) -> bool:
+    seg = _path_last_segment(target)
+    return seg in JUNK_PATH_SEGMENTS
+
+
+def _query_keys(url: str) -> list:
+    parsed = _parse_url(url)
+    if parsed is None or not parsed.query:
+        return []
+    keys = []
+    for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _is_weak_injection_url(url: str) -> bool:
+    parsed = _parse_url(url) or _parse_url(_http_url(url))
+    if parsed is None:
+        return True
+    if _is_static_asset(url) or STATIC_EXT_RE.search(parsed.path or ""):
+        return True
+    if _is_junk_target(url):
+        return True
+    keys = _query_keys(url)
+    if keys and all(k.lower() in WEAK_QUERY_KEYS or k.lower().startswith("utm_") for k in keys):
+        return True
+    path = parsed.path or ""
+    if re.match(r"^/_[A-Za-z0-9._-]+/?$", path) and not parsed.query:
+        return True
+    return False
+
+
+def _catchall_sizes(text: str, min_hits: int = CATCHALL_SIZE_HITS) -> set:
+    sizes = re.findall(r"\[Size:\s*(\d+)\]", text or "", re.IGNORECASE)
+    if len(sizes) < min_hits:
+        return set()
+    counts = {}
+    for size in sizes:
+        counts[size] = counts.get(size, 0) + 1
+    dominant = max(counts.values()) if counts else 0
+    if dominant < min_hits:
+        return set()
+    return {size for size, n in counts.items() if n >= min_hits and n / len(sizes) >= 0.5}
+
+
+def _usable_model_text(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return not any(t.startswith(p) for p in ERROR_REPLY_PREFIXES)
+
+
+def _looks_like_schema(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"^\s*VULN:", text, re.MULTILINE) or re.search(
+        r"RISK_LEVEL", text, re.IGNORECASE
+    ))
+
+
 def _url_has_query(url: str) -> bool:
     parsed = _parse_url(url)
     return bool(parsed and parsed.query)
@@ -272,13 +365,15 @@ def _join_origin_path(origin: str, path: str) -> str:
     return urljoin(base, path)
 
 
-def _add_harvested(url: str, host: str, seen: set, found: list, cap: int) -> bool:
+def _add_harvested(url: str, host: str, seen: set, found: list, cap: int, skip_catchall: bool = False) -> bool:
     parsed = _parse_url(url)
     if parsed is None or _is_truncated_bracket_url(url, parsed):
         return False
     if url in seen or not _same_host(url, host):
         return False
-    if _is_static_asset(url):
+    if _is_static_asset(url) or _is_junk_target(url):
+        return False
+    if skip_catchall and re.match(r"^/_[A-Za-z0-9._-]+/?$", parsed.path or ""):
         return False
     seen.add(url)
     found.append(url)
@@ -290,10 +385,11 @@ def harvest_urls(text: str, host: str, cap: int = MAX_DISCOVERED_URLS, origin: s
     seen = set()
     blob = text or ""
     base = origin or (_http_url(host) if host else "")
+    skip_catchall = bool(_catchall_sizes(blob))
 
     for raw in URL_RE.findall(blob):
         url = _strip_url(raw)
-        if _add_harvested(url, host, seen, found, cap):
+        if _add_harvested(url, host, seen, found, cap, skip_catchall=skip_catchall):
             return found
 
     if base:
@@ -308,7 +404,7 @@ def harvest_urls(text: str, host: str, cap: int = MAX_DISCOVERED_URLS, origin: s
             url = _join_origin_path(base, path)
             if not url:
                 continue
-            if _add_harvested(url, host, seen, found, cap):
+            if _add_harvested(url, host, seen, found, cap, skip_catchall=skip_catchall):
                 return found
     return found
 
@@ -388,13 +484,13 @@ def injection_target(origin: str, urls: list) -> str:
         parsed = _parse_url(url)
         if parsed is None or _is_truncated_bracket_url(url, parsed):
             continue
-        if parsed.query:
+        if parsed.query and not _is_weak_injection_url(url):
             return url
     for url in ranked_urls(urls):
         parsed = _parse_url(url)
         if parsed is None or _is_truncated_bracket_url(url, parsed):
             continue
-        if parsed.path not in ("", "/") and not _is_static_asset(url):
+        if parsed.path not in ("", "/") and not _is_static_asset(url) and not _is_weak_injection_url(url):
             return url
     return origin
 
@@ -507,9 +603,9 @@ def injection_covered(
     if name not in ran:
         return False
     urls = (ran_injection_urls or {}).get(name, set())
-    if any(_url_has_query(u) for u in urls):
+    if any(_url_has_query(u) and not _is_weak_injection_url(u) for u in urls):
         return True
-    if not any(_url_has_query(u) for u in (discovered or [])):
+    if not any(_url_has_query(u) and not _is_weak_injection_url(u) for u in (discovered or [])):
         return True
     if name in (retargeted or set()):
         return True
@@ -608,7 +704,8 @@ def checklist_message(
         lines.append("Do not write RISK_LEVEL yet. Emit tags only for the gaps above.")
         lines.append(f"Loops left: {loops_left}")
     else:
-        lines.append("Checklist complete. Do not emit more tools unless a CVE still needs SEARCH.")
+        lines.append("Checklist complete. If you still need a tool, emit tags.")
+        lines.append("Otherwise write the VULN:/EXPLOIT:/RISK_LEVEL schema now (plain text, no markdown).")
     return "\n".join(lines)
 
 
@@ -632,6 +729,57 @@ def extract_tool_calls(response: str) -> list:
         calls.append(("SEARCH", m.strip()))
 
     return calls
+
+
+def _search_is_cve(query: str) -> bool:
+    return bool(CVE_RE.search(query or ""))
+
+
+def _search_looks_like_fake_cve(query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return True
+    if re.match(r"CVE[\s:=_-]", q, re.IGNORECASE) and not _search_is_cve(q):
+        return True
+    if q.lower().startswith("cve") and not _search_is_cve(q):
+        return True
+    return False
+
+
+def sanitize_calls(calls: list, origin: str = "", is_wp: bool = False) -> list:
+    """Drop junk SEARCH/TARGET tags the model invents."""
+    cleaned = []
+    for call_type, content in calls or []:
+        if call_type == "SEARCH":
+            if _search_looks_like_fake_cve(content) and not _search_is_cve(content):
+                print(f"  [!] Ignoring SEARCH (not a CVE id): {content}")
+                continue
+            cleaned.append((call_type, content))
+            continue
+        if call_type != "TOOL":
+            cleaned.append((call_type, content))
+            continue
+        parts = (content or "").split()
+        if not parts:
+            continue
+        tool = _canonical_tool(parts[0])
+        target = _extract_dispatch_target(parts)
+        if tool == "wpscan" and not is_wp:
+            print("  [!] Ignoring wpscan — target does not look like WordPress.")
+            continue
+        if target and _is_junk_target(target):
+            if origin:
+                print(f"  [!] Replacing junk TARGET {target} with origin")
+                content = f"{tool} {origin}"
+                target = origin
+            else:
+                print(f"  [!] Ignoring TOOL {tool} with junk TARGET {target}")
+                continue
+        if tool in INJECTION_TOOLS and target and _is_weak_injection_url(target):
+            print(f"  [!] Ignoring {tool} on weak/static URL: {target}")
+            continue
+        cleaned.append(("TOOL", content))
+    return cleaned
 
 
 def _call_key(call: tuple) -> tuple:
@@ -711,7 +859,7 @@ def record_calls(
             ran_injection_urls.setdefault(tool, set()).add(_canonical_scan_url(target))
 
 
-def run_tool_calls(calls: list, session_host: str = "") -> str:
+def run_tool_calls(calls: list, session_host: str = "", is_wp: bool = False) -> str:
     """
     Execute all tool/search calls and return combined evidence string.
     """
@@ -723,9 +871,26 @@ def run_tool_calls(calls: list, session_host: str = "") -> str:
         print(f"\n  [DISPATCH] {call_type}: {call_content}")
 
         if call_type == "TOOL":
-            output = run_tool_by_command(call_content)
+            parts = call_content.split()
+            tool = _canonical_tool(parts[0]) if parts else ""
+            target = _extract_dispatch_target(parts) if parts else ""
+            if tool == "wpscan" and not is_wp:
+                output = "[!] Skipping wpscan — target does not look like WordPress."
+                print(f"  {output}")
+            elif tool in INJECTION_TOOLS and target and _is_weak_injection_url(target):
+                output = f"[!] Skipping {tool} on weak/static URL: {target}"
+                print(f"  {output}")
+            elif target and _is_junk_target(target):
+                output = f"[!] Skipping {tool} — junk TARGET {target}"
+                print(f"  {output}")
+            else:
+                output = run_tool_by_command(call_content)
         elif call_type == "SEARCH":
-            output = handle_search_dispatch(call_content)
+            if _search_looks_like_fake_cve(call_content) and not _search_is_cve(call_content):
+                output = f"[!] Skipping SEARCH — not a CVE id: {call_content}"
+                print(f"  {output}")
+            else:
+                output = handle_search_dispatch(call_content)
         else:
             output = f"[!] Unknown call type: {call_type}"
 
@@ -848,10 +1013,10 @@ def parse_exploits(response: str) -> list:
 
 
 def parse_risk_level(response: str) -> str:
-    """Extract RISK_LEVEL from AI response (tolerate markdown/backticks)."""
-    cleaned = (response or "").replace("`", "")
+    """Extract RISK_LEVEL from AI response (tolerate markdown/backticks/headings)."""
+    cleaned = re.sub(r"[`*_#]", "", response or "")
     match = re.search(
-        r"(?<![A-Z_])RISK_LEVEL:\s*[*_#]*\s*(CRITICAL|HIGH|MEDIUM|LOW)",
+        r"RISK[_ ]?LEVEL\s*:?\s*(CRITICAL|HIGH|MEDIUM|LOW)",
         cleaned,
         re.IGNORECASE,
     )
@@ -860,11 +1025,31 @@ def parse_risk_level(response: str) -> str:
 
 def parse_summary(response: str) -> str:
     match = re.search(
-        r"(?<![A-Z_])SUMMARY:\s*(.+)",
+        r"SUMMARY:\s*(.+?)(?=\n\s*(?:VULN:|EXPLOIT:|RISK_LEVEL:|IMPORTANT:)|\Z)",
         response or "",
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     )
-    return match.group(1).strip() if match else ""
+    if not match:
+        return ""
+    text = re.sub(r"\s+", " ", match.group(1)).strip()
+    return text[:800]
+
+
+def _pick_schema_text(finalize: str, transcript: list) -> str:
+    """Prefer finalize schema; fall back to last usable round like original METATRON."""
+    if _usable_model_text(finalize) and (
+        _looks_like_schema(finalize) or parse_risk_level(finalize) != "UNKNOWN"
+    ):
+        return finalize
+    for text in reversed(transcript or []):
+        if _usable_model_text(text) and _looks_like_schema(text):
+            return text
+    if _usable_model_text(finalize):
+        return finalize
+    for text in reversed(transcript or []):
+        if _usable_model_text(text):
+            return text
+    return (finalize or "").strip()
 
 
 def _cap_evidence(chunks: list) -> str:
@@ -922,15 +1107,19 @@ def analyse_target(target: str, raw_scan: str) -> dict:
         print(f"[METATRON - Round {loop + 1}]")
         print(f"{'─'*60}")
         print(response)
+        if not _usable_model_text(response):
+            print("[!] Skipping empty/error model round.")
+            continue
         transcript.append(response)
 
-        model_calls = extract_tool_calls(response)
+        model_calls = sanitize_calls(extract_tool_calls(response), origin, is_wp)
         auto_calls = []
         if missing or unverified or curl_pending:
             auto_calls = build_auto_dispatch(
                 missing, unverified, cve_urls, discovered, origin, curled_urls,
                 ran_tools, ran_injection_urls, retargeted,
             )
+        auto_calls = sanitize_calls(auto_calls, origin, is_wp)
         calls = merge_calls(model_calls, auto_calls)
         auto = bool(auto_calls) and any(c not in model_calls for c in calls)
         if auto and auto_calls:
@@ -941,7 +1130,7 @@ def analyse_target(target: str, raw_scan: str) -> dict:
             break
 
         record_calls(calls, ran_tools, searched_cves, curled_urls, ran_injection_urls)
-        tool_results = run_tool_calls(calls, session_host=host)
+        tool_results = run_tool_calls(calls, session_host=host, is_wp=is_wp)
         evidence_chunks.append(tool_results)
 
         all_cves = list(dict.fromkeys(all_cves + extract_cves(tool_results)))
@@ -986,20 +1175,27 @@ def analyse_target(target: str, raw_scan: str) -> dict:
         [
             {"role": "system", "content": FINALIZE_PROMPT},
             {"role": "user", "content": finalize_user},
-        ]
+        ],
+        retries=2,
     )
     print(finalize_response)
-    transcript.append(finalize_response)
+    if _usable_model_text(finalize_response):
+        transcript.append(finalize_response)
 
-    vulnerabilities = parse_vulnerabilities(finalize_response)
-    exploits = parse_exploits(finalize_response)
-    risk_level = parse_risk_level(finalize_response)
-    summary = parse_summary(finalize_response)
+    record_text = _pick_schema_text(finalize_response, transcript)
+    if record_text != finalize_response:
+        print("[*] Finalize empty or unparsed — using last schema reply (original METATRON behavior).")
+        print(record_text)
+
+    vulnerabilities = parse_vulnerabilities(record_text)
+    exploits = parse_exploits(record_text)
+    risk_level = parse_risk_level(record_text)
+    summary = parse_summary(record_text)
 
     print(f"\n[+] Parsed: {len(vulnerabilities)} vulns, {len(exploits)} exploits | Risk: {risk_level}")
 
     return {
-        "full_response": "\n\n".join(transcript),
+        "full_response": record_text,
         "vulnerabilities": vulnerabilities,
         "exploits": exploits,
         "risk_level": risk_level,

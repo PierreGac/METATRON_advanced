@@ -240,7 +240,12 @@ def probe_safe_get_forms(page, forms: list, is_allowed, timeout_ms: int, start_u
 def run_probe(args: argparse.Namespace) -> int:
     try:
         from playwright.sync_api import sync_playwright
-        import playwright as playwright_pkg
+        try:
+            from importlib.metadata import version as pkg_version
+            pw_ver = pkg_version("playwright")
+        except Exception:
+            import playwright as playwright_pkg
+            pw_ver = getattr(playwright_pkg, "__version__", "unknown")
     except ImportError:
         _print("[!] Playwright is not installed. Install with:")
         _print("    pip install playwright && playwright install chromium")
@@ -261,7 +266,7 @@ def run_probe(args: argparse.Namespace) -> int:
     forms = []
     canary_urls = []
 
-    _print(f"[*] playwright {getattr(playwright_pkg, '__version__', 'unknown')}")
+    _print(f"[*] playwright {pw_ver}")
     _print(f"[*] start URL: {args.url}")
     _print(f"[*] origin lock host: {start_host}")
     if allowed_hosts:
@@ -414,6 +419,7 @@ def run_probe(args: argparse.Namespace) -> int:
                     clicks_left -= 1
                 except Exception as exc:
                     _print(f"  [!] click failed: {exc}")
+                    clicks_left -= 1
 
             for button in buttons:
                 if clicks_left <= 0:
@@ -449,6 +455,7 @@ def run_probe(args: argparse.Namespace) -> int:
                     clicks_left -= 1
                 except Exception as exc:
                     _print(f"  [!] button click failed: {exc}")
+                    clicks_left -= 1
 
             context.close()
             browser.close()

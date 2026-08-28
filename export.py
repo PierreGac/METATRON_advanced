@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 
+import html as html_lib
 import os
 import datetime
+from pathlib import Path
+
 import mysql.connector
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 from reportlab.lib.enums import TA_CENTER
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+RECON_EXPORT_CHARS = 4000
 
 SEVERITY_COLORS = {
     "critical": "#c0392b",
@@ -61,6 +67,24 @@ def fetch_all_history():
     rows = c.fetchall()
     conn.close()
     return rows
+
+
+def reports_dir() -> str:
+    path = PROJECT_ROOT / "reports"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _recon_excerpt(data: dict) -> str:
+    summary = data.get("summary")
+    if not summary or len(summary) < 3:
+        return ""
+    raw = str(summary[2] or "").strip()
+    if not raw:
+        return ""
+    if len(raw) > RECON_EXPORT_CHARS:
+        return raw[:RECON_EXPORT_CHARS] + "\n[truncated]"
+    return raw
 
 
 def export_pdf(data: dict, output_dir: str) -> str:
@@ -195,6 +219,18 @@ def export_pdf(data: dict, output_dir: str) -> str:
     else:
         story.append(Paragraph("No exploits recorded.", body_style))
 
+    recon = _recon_excerpt(data)
+    if recon:
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Recon Highlights", h1_style))
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                 color=colors.HexColor("#dddddd"), spaceAfter=6))
+        for line in recon.split("\n"):
+            line = line.strip()
+            if line:
+                story.append(Paragraph(html_lib.escape(line)[:500], body_style))
+                story.append(Spacer(1, 1))
+
     story.append(Spacer(1, 6))
     story.append(Paragraph("AI Analysis Summary", h1_style))
     story.append(HRFlowable(width="100%", thickness=0.5,
@@ -203,7 +239,7 @@ def export_pdf(data: dict, output_dir: str) -> str:
         for line in str(ai).split("\n"):
             line = line.strip()
             if line:
-                story.append(Paragraph(line, body_style))
+                story.append(Paragraph(html_lib.escape(line), body_style))
                 story.append(Spacer(1, 2))
     else:
         story.append(Paragraph("No AI analysis recorded.", body_style))
@@ -236,7 +272,7 @@ def export_html(data: dict, output_dir: str) -> str:
     for v in data["vulns"]:
         sc = SEVERITY_COLORS.get((v[3] or "unknown").lower(), "#7f8c8d")
         vuln_rows += (f"<tr><td>{v[0]}</td>"
-                      f"<td><strong>{v[2]}</strong><br><small>{v[6] or ''}</small></td>"
+                      f"<td><strong>{html_lib.escape(str(v[2] or ''))}</strong><br><small>{html_lib.escape(str(v[6] or ''))}</small></td>"
                       f"<td><span style='color:{sc};font-weight:bold'>"
                       f"{(v[3] or 'unknown').upper()}</span></td>"
                       f"<td>{v[4] or '-'}</td><td>{v[5] or '-'}</td></tr>")
@@ -244,17 +280,22 @@ def export_html(data: dict, output_dir: str) -> str:
     fix_rows = ""
     for f in data["fixes"]:
         fix_rows += (f"<tr><td>{f[0]}</td><td>vuln #{f[2]}</td>"
-                     f"<td><code>{f[3] or '-'}</code></td>"
+                     f"<td><code>{html_lib.escape(str(f[3] or '-'))}</code></td>"
                      f"<td>{f[4] or 'ai'}</td></tr>")
 
     exp_rows = ""
     for e in data["exploits"]:
-        exp_rows += (f"<tr><td>{e[0]}</td><td>{e[2] or '-'}</td>"
-                     f"<td>{e[3] or '-'}</td>"
-                     f"<td><code>{str(e[4] or '-')[:80]}</code></td>"
-                     f"<td>{e[5] or '-'}</td></tr>")
+        exp_rows += (f"<tr><td>{e[0]}</td><td>{html_lib.escape(str(e[2] or '-'))}</td>"
+                     f"<td>{html_lib.escape(str(e[3] or '-'))}</td>"
+                     f"<td><code>{html_lib.escape(str(e[4] or '-')[:80])}</code></td>"
+                     f"<td>{html_lib.escape(str(e[5] or '-'))}</td></tr>")
 
-    ai_html = "".join(f"<p>{line}</p>"
+    recon = _recon_excerpt(data)
+    recon_html = ""
+    if recon:
+        recon_html = "<pre style=\"white-space:pre-wrap;font-size:.8em;color:#aaa\">" + html_lib.escape(recon) + "</pre>"
+
+    ai_html = "".join(f"<p>{html_lib.escape(line)}</p>"
                       for line in str(ai).split("\n") if line.strip())
 
     html = f"""<!DOCTYPE html>
@@ -335,6 +376,11 @@ a{{color:#555}}
 </section>
 
 <section>
+  <h2>Recon Highlights</h2>
+  {recon_html if recon_html else '<p style="color:#888">None recorded.</p>'}
+</section>
+
+<section>
   <h2>AI Analysis Summary</h2>
   <div class="ai-box">
     {ai_html if ai_html else '<p style="color:#888">None recorded.</p>'}
@@ -373,8 +419,7 @@ def export_menu(data: dict):
     print(f"\033[90m{'─'*60}\033[0m")
 
     choice     = input("\033[36mExport format: \033[0m").strip()
-    output_dir = os.path.expanduser("~/METATRON/reports")
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = reports_dir()
 
     if choice == "1":
         p = export_pdf(data, output_dir)
