@@ -184,6 +184,9 @@ def new_scan():
         divider("AI ANALYSIS")
         result = analyse_target(target, raw_scan)
 
+    if result.get("markdown_path"):
+        success(f"Markdown report: {result['markdown_path']}")
+
     # ── save everything to DB ──────────────────
     divider("SAVING TO DATABASE")
 

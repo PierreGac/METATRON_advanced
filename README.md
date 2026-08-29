@@ -451,36 +451,55 @@ or
 
 **4. Review or edit configuration** for the selected tools (`tools_config.json`). Each tool is shown in its own `=== name ===` block. Press Enter to run, or `e` to edit the JSON in `$EDITOR` (nano by default).
 
-**5. Metatron streams tool output live.** If a tool times out you can retry with a higher timeout (`y`), edit config (`e`), or keep the partial log (`N`). Full logs (not truncated) go to `scan_results/<target>/<timestamp>/<tool>.log`. The copy sent to the AI is capped by `_global.max_log_lines` (default 2000).
+**5. Metatron runs selected tools in JSON-defined waves** (independent tools in parallel). Progress bars (`\r`, ZAP percent) are stripped from logs. Parallel waves show a heartbeat line instead of interleaving stdout. Timeouts in parallel do not prompt; the wave continues.
 
-**6. Results are fed to the AI.** The model emits `[TOOL:]` / `[SEARCH:]` tags (TARGET only; flags come from JSON). Missing scanners and unverified CVEs are auto-dispatched. A final schema-only pass writes `VULN:` / `RISK_LEVEL:` for the database.
+**6. Results are fed to the AI.** The model writes a `PLAN:` then `[TOOL: name TARGET:... PROFILE:... SCENARIO:...]` tags. Flags always come from JSON **profiles** (`default` / `aggressive` / `exploit`). Duplicate (tool, endpoint, profile) runs are skipped. Auto-dispatch only fills CVE `[SEARCH:]` and evidence `curl`. A finalize pass writes `VULN:` / `RISK_LEVEL:` for MariaDB. A markdown report is written to `scan_results/<target>/<stamp>/report.md` and `reports/metatron_last.md`.
 
 **7. Everything is saved to MariaDB automatically.**
 
-**8. After the scan you can edit or delete any result.**
+**8. After the scan you can edit, delete, or export PDF/HTML/Markdown.**
 
 ---
 
 ## ⚙️ Tool configuration
 
-[`tools_config.json`](tools_config.json) controls timeouts, flags, wordlists, crawl depth, ZAP spider limits, and Playwright click settings. JSON cannot change the binary name (`argv[0]`). AI `[TOOL: name TARGET]` tags use the same JSON flags — extra flags the model writes are ignored. The AI may change **TARGET** (origin or a discovered same-host URL) and an optional **SCENARIO** name for gobuster/ffuf wordlists. The analysis loop auto-runs missing web scanners if the model forgets tags, searches unverified CVEs, then does a schema-only finalize pass; **that** finalize output is what is parsed into MariaDB.
+[`tools_config.json`](tools_config.json) controls timeouts, flags, wordlists, crawl depth, ZAP spider limits, Playwright clicks, **named profiles**, and the **wave scheduler**. JSON cannot change the binary name (`argv[0]`). AI tags:
 
-Placeholders in `args`: `{target}`, `{url}`, `{host}`, `{wordlist}`, `{crawl}`, `{depth}`. `{host}` is the hostname (no scheme or path) for tools like gau/subfinder. Relative wordlist paths are resolved against the detected SecLists root (usually `/usr/share/wordlists` after the git clone, or `/usr/share/seclists` / `/usr/share/wordlists/seclists` from apt). Dirb `common.txt` is used only if SecLists is missing. Katana includes `-jc` (JS crawl) for SPAs. Playwright dismisses cookie/consent dialogs before other clicks.
+```
+[TOOL: sqlmap TARGET:https://host/search?q=test PROFILE:aggressive]
+[TOOL: gobuster TARGET:https://host PROFILE:default SCENARIO:api]
+[TOOL: searchsploit TARGET:CVE-2024-1234 PROFILE:default]
+```
 
-Append extra flags with `extra_args`. Global keys:
+**PROFILE** selects argv (`default` → `aggressive` → `exploit` via `extends`). **SCENARIO** selects an allowlisted wordlist. Invented `-flags` are ignored. `PROFILE:exploit` (`--os-shell` / `--os-cmd`) is not used unless a prior default/aggressive run exists on that endpoint (`exploit_requires_detect`).
+
+The first user-selected pass uses each tool’s **default** profile in waves. Follow-up is AI-planned; only unverified CVEs and curl evidence are auto-filled.
+
+Placeholders in `args`: `{target}`, `{url}`, `{host}`, `{wordlist}`, `{crawl}`, `{depth}`.
+
+Set `METATRON_DRY_RUN=1` to print argv without executing (useful for tests). Optional `psutil` enables RAM/load throttling (`ram_percent_limit`, `load_per_cpu_limit`).
+
+Global keys:
 
 ```json
 "_global": {
   "max_log_lines": 2000,
   "timeout_retry_multiplier": 2,
   "results_dir": "scan_results",
-  "wordlists_root": ""
+  "wordlists_root": "",
+  "max_workers": 4,
+  "max_injection_endpoints": 3,
+  "max_exploit_runs": 1,
+  "exploit_requires_detect": true,
+  "idle_reset": true
 }
 ```
 
-Leave `wordlists_root` empty to auto-detect. Set it to override (for example a git clone elsewhere). Named scenarios live in the top-level `wordlists` object.
+**Timeouts** are idle by default: `timeout` is seconds of silence, and any stdout/stderr from the tool resets the timer (gobuster progress, ZAP crawls, etc. keep running). Optional `max_timeout` is a hard wall-clock cap from process start (`0` = none). Set `"idle_reset": false` on a tool (or `_global`) to restore old wall-clock timeout from start.
 
-ZAP defaults cap spider children/depth/duration so `-quickurl` does not run unbounded. Playwright stays on the start host unless you set `allowed_hosts` or `allow_subdomains`.
+Edit the `waves` array to change parallelism and dependencies. Tools not listed fall into a serial `other` wave.
+
+Leave `wordlists_root` empty to auto-detect. Named scenarios live in the top-level `wordlists` object. ZAP defaults omit `-quickprogress`; alerts come from the XML summary. Playwright stays on the start host unless you set `allowed_hosts` or `allow_subdomains`.
 
 ---
 
@@ -491,8 +510,10 @@ METATRON/
 ├── install.sh          ← sudo full install (apt, venv, Playwright, Go tools, Ollama)
 ├── metatron.py         ← main CLI entry point
 ├── db.py               ← MariaDB connection and all CRUD operations
-├── tools.py            ← recon / web-test runners, live logs, config
-├── tools_config.json   ← per-tool timeouts, args, wordlists, ZAP/Playwright settings
+├── dispatch.py         ← tag parse, dedup, sanitizer, safety gates
+├── report_md.py        ← markdown report renderer
+├── tools.py            ← recon / web-test runners, live logs, config, waves
+├── tools_config.json   ← profiles, waves, timeouts, wordlists
 ├── browser_probe.py    ← origin-locked Playwright click probe
 ├── llm.py              ← Ollama interface and AI tool dispatch loop
 ├── search.py           ← DuckDuckGo web search and CVE lookup

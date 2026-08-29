@@ -17,9 +17,23 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from dispatch import (
+    DEFAULT_WAVES,
+    apply_safety_gates,
+    dry_run_enabled,
+    format_tool_call,
+    group_jobs_by_wave,
+    parse_tool_tag,
+    run_key,
+    sanitize_tool_chunk,
+    throttle_resources,
+    tools_by_wave,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -115,7 +129,16 @@ DEFAULT_CONFIG = {
         "timeout_retry_multiplier": 2,
         "results_dir": "scan_results",
         "wordlists_root": "",
+        "max_workers": 4,
+        "ram_percent_limit": 85,
+        "load_per_cpu_limit": 2.0,
+        "max_injection_endpoints": 3,
+        "max_exploit_runs": 1,
+        "exploit_requires_detect": True,
+        "write_raw_logs": False,
+        "idle_reset": True,
     },
+    "waves": DEFAULT_WAVES,
     "wordlists": DEFAULT_WORDLISTS,
     "nmap": {"timeout": 180, "args": ["-sV", "-sC", "-T4", "--open", "{host}"], "extra_args": []},
     "whois": {"timeout": 30, "args": ["{host}"], "extra_args": []},
@@ -176,7 +199,7 @@ DEFAULT_CONFIG = {
         "idle_reset": True,
         "max_timeout": 3600,
         "args": [
-            "-cmd", "-quickurl", "{url}", "-quickprogress",
+            "-cmd", "-quickurl", "{url}",
             "-config", "spider.maxChildren=10",
             "-config", "spider.maxDepth=2",
             "-config", "spider.maxDuration=5",
@@ -218,6 +241,7 @@ _config = None
 _version_cache = {}
 _current_results_dir = None
 _log_lock = threading.Lock()
+_print_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────
@@ -380,10 +404,109 @@ def get_tool_config(name: str) -> dict:
     return tool_cfg
 
 
+def get_waves_config() -> list:
+    cfg = load_tools_config()
+    waves = cfg.get("waves")
+    if isinstance(waves, list) and waves:
+        return waves
+    return list(DEFAULT_WAVES)
+
+
+def resolve_profile(cfg: dict, name: str = None) -> dict:
+    """
+    Merge PROFILE inheritance. Child args replace if present; extra_args append.
+    Unknown profile names fall back to default_profile then top-level args.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    result = dict(cfg)
+    profiles = cfg.get("profiles") if isinstance(cfg.get("profiles"), dict) else {}
+    default_name = str(cfg.get("default_profile") or "default").strip().lower() or "default"
+    wanted = (name or default_name).strip().lower() or default_name
+
+    def _base_from_top():
+        return {
+            "timeout": cfg.get("timeout"),
+            "crawl": cfg.get("crawl"),
+            "depth": cfg.get("depth"),
+            "idle_reset": cfg.get("idle_reset"),
+            "max_timeout": cfg.get("max_timeout"),
+            "wordlist": cfg.get("wordlist"),
+            "args": list(cfg.get("args") or []),
+            "extra_args": list(cfg.get("extra_args") or []),
+        }
+
+    if wanted not in profiles:
+        if name and wanted != default_name:
+            print(f"  [!] Unknown PROFILE:{wanted} — using {default_name}")
+            wanted = default_name
+        if wanted not in profiles:
+            merged = _base_from_top()
+            result.update({k: v for k, v in merged.items() if v is not None or k in ("args", "extra_args")})
+            result["_profile"] = wanted
+            return result
+
+    def _merge(profile_name, seen):
+        if profile_name in seen:
+            print(f"  [!] PROFILE cycle involving {profile_name} — using default")
+            return _base_from_top()
+        seen = seen | {profile_name}
+        spec = profiles.get(profile_name)
+        if not isinstance(spec, dict):
+            return _base_from_top()
+        parent_name = str(spec.get("extends") or "").strip().lower()
+        if parent_name:
+            base = _merge(parent_name, seen)
+        else:
+            base = _base_from_top()
+        out = dict(base)
+        for key in ("timeout", "crawl", "depth", "idle_reset", "max_timeout", "wordlist"):
+            if key in spec and spec[key] is not None:
+                out[key] = spec[key]
+        if spec.get("args") is not None:
+            out["args"] = list(spec.get("args") or [])
+        inherited = list(out.get("extra_args") or [])
+        for item in list(spec.get("extra_args") or []):
+            if item not in inherited:
+                inherited.append(item)
+        out["extra_args"] = inherited
+        return out
+
+    merged = _merge(wanted, set())
+    result.update({k: v for k, v in merged.items() if v is not None or k in ("args", "extra_args")})
+    result["_profile"] = wanted
+    return result
+
+
 def get_global_config() -> dict:
     cfg = load_tools_config()
     global_cfg = cfg.get("_global", {})
     return global_cfg if isinstance(global_cfg, dict) else {}
+
+
+def _timeout_policy(cfg: dict = None) -> tuple:
+    """
+    timeout is silence seconds by default: any tool output resets the timer.
+    Set idle_reset false on a tool (or _global) for wall-clock timeout.
+    max_timeout is an optional hard cap from process start (0 = none).
+    """
+    global_cfg = get_global_config()
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if cfg.get("idle_reset") is not None:
+        idle = bool(cfg.get("idle_reset"))
+    elif global_cfg.get("idle_reset") is not None:
+        idle = bool(global_cfg.get("idle_reset"))
+    else:
+        idle = True
+    try:
+        max_timeout = int(cfg.get("max_timeout") or global_cfg.get("max_timeout") or 0)
+    except (TypeError, ValueError):
+        max_timeout = 0
+    return idle, max_timeout
+
+
+def _run_tool_timeout_kwargs(tool: str = "", cfg: dict = None) -> dict:
+    idle, max_timeout = _timeout_policy(cfg if cfg is not None else get_tool_config(tool))
+    return {"idle_reset": idle, "max_timeout": max_timeout}
 
 
 def _looks_like_seclists_root(path: str) -> bool:
@@ -620,9 +743,10 @@ def substitute_args(args: list, target: str, cfg: dict, wordlist: str = None) ->
     return out
 
 
-def build_command(binary: str, target: str, cfg: dict, scenario: str = None, tool: str = None) -> list:
+def build_command(binary: str, target: str, cfg: dict, scenario: str = None, tool: str = None, profile: str = None) -> list:
     """Build argv. Binary (argv[0]) is never taken from JSON args/extra_args."""
     logical = tool or Path(str(binary)).name
+    cfg = resolve_profile(cfg, profile)
     wordlist = resolve_wordlist(cfg, scenario=scenario, tool=logical)
     args = substitute_args(list(cfg.get("args") or []), target, cfg, wordlist=wordlist)
     extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg, wordlist=wordlist)
@@ -928,6 +1052,19 @@ def _append_log_file(tool_name: str, text: str) -> None:
                 fh.write("\n")
 
 
+def _append_raw_log(tool_name: str, text: str) -> None:
+    if not _current_results_dir or not tool_name:
+        return
+    if not get_global_config().get("write_raw_logs"):
+        return
+    log_path = _current_results_dir / f"{tool_name}.raw.log"
+    with _log_lock:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(text)
+            if not text.endswith("\n"):
+                fh.write("\n")
+
+
 ZAP_PROGRESS_RE = re.compile(r"^\s*\[[=\s]*\]\s*\d+%")
 
 
@@ -1017,7 +1154,9 @@ def _filter_live_output(tool_name: str, text: str, state: dict) -> str:
 def _wait_process(proc, timeout: int, idle_reset: bool, max_timeout: int, activity: dict) -> bool:
     """
     Wait until the process exits. Return True if we killed it for timeout.
-    Wall-clock timeout unless idle_reset: then `timeout` is silence, max_timeout is the hard cap.
+    idle_reset (default): `timeout` is seconds of silence; any stdout/stderr
+    chunk resets the timer. max_timeout is an optional wall-clock cap (0 = none).
+    idle_reset false: `timeout` is wall-clock from process start.
     """
     start = time.monotonic()
     if not idle_reset:
@@ -1055,13 +1194,14 @@ def run_tool(
     tool_name: str = "",
     allow_retry: bool = False,
     _retried: bool = False,
-    idle_reset: bool = False,
+    idle_reset: bool = True,
     max_timeout: int = 0,
+    quiet: bool = False,
 ) -> str:
     """
     Execute a command, stream stdout+stderr live, save full log to disk,
     return a (possibly truncated) string for the LLM.
-    timeout is wall-clock seconds, or silence seconds when idle_reset is True.
+    timeout is silence seconds by default (any output resets the timer).
     """
     if not command:
         return "[!] Empty command."
@@ -1072,6 +1212,13 @@ def run_tool(
     global_cfg = get_global_config()
     max_lines = int(global_cfg.get("max_log_lines", 2000) or 2000)
 
+    if dry_run_enabled():
+        msg = f"[dry-run] {display}"
+        if not quiet:
+            print(msg)
+        _append_log_file(name, msg + "\n")
+        return msg
+
     version = _probe_version(binary)
     if version:
         _append_log_file(name, f"[version] {binary}: {version}\n")
@@ -1081,7 +1228,6 @@ def run_tool(
     proc = None
     activity = {"t": time.monotonic()}
     started = time.monotonic()
-    live_state = {"xml": False}
 
     try:
         proc = subprocess.Popen(
@@ -1102,11 +1248,14 @@ def run_tool(
                     break
                 activity["t"] = time.monotonic()
                 text = chunk.decode("utf-8", errors="replace")
-                console_text = _filter_live_output(name, text, live_state)
-                if console_text:
-                    print(console_text, end="", flush=True)
-                captured.append(text)
-                _append_log_file(name, text)
+                _append_raw_log(name, text)
+                cleaned = sanitize_tool_chunk(text, name)
+                if cleaned:
+                    if not quiet:
+                        with _print_lock:
+                            print(cleaned, end="", flush=True)
+                    captured.append(cleaned)
+                    _append_log_file(name, cleaned)
 
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
@@ -1154,7 +1303,7 @@ def run_tool(
         _append_log_file(name, notice + "\n")
         partial = body + ("\n" if body else "") + notice
 
-        if allow_retry and not _retried:
+        if allow_retry and not _retried and not quiet:
             multiplier = float(global_cfg.get("timeout_retry_multiplier", 2) or 2)
             bumped = max(int(timeout * multiplier), timeout + 1)
             bumped_max = int(max_timeout * multiplier) if max_timeout else 0
@@ -1171,13 +1320,13 @@ def run_tool(
                     _retried=True,
                     idle_reset=idle_reset,
                     max_timeout=bumped_max or max_timeout,
+                    quiet=quiet,
                 )
             if choice == "e":
                 prompt_edit_config([name])
                 new_cfg = get_tool_config(name)
                 new_timeout = int(new_cfg.get("timeout", bumped) or bumped)
-                new_idle = bool(new_cfg.get("idle_reset", idle_reset))
-                new_max = int(new_cfg.get("max_timeout", max_timeout) or 0)
+                new_idle, new_max = _timeout_policy(new_cfg)
                 print(f"[*] Retrying with timeout={new_timeout}s from config...")
                 return run_tool(
                     command,
@@ -1187,6 +1336,7 @@ def run_tool(
                     _retried=True,
                     idle_reset=new_idle,
                     max_timeout=new_max,
+                    quiet=quiet,
                 )
         if name == "zaproxy":
             partial = _attach_zap_report(partial)
@@ -1235,7 +1385,13 @@ def _retry_gobuster_wildcard(output: str, command: list, timeout: int) -> str:
     retry_cmd = list(command) + ["--exclude-length", length]
     print(f"  [*] gobuster catch-all size {length} — retrying with --exclude-length {length}")
     print(f"  [*] {' '.join(str(c) for c in retry_cmd)}")
-    retry_out = run_tool(retry_cmd, timeout=timeout, tool_name="gobuster", allow_retry=False)
+    retry_out = run_tool(
+        retry_cmd,
+        timeout=timeout,
+        tool_name="gobuster",
+        allow_retry=False,
+        **_run_tool_timeout_kwargs("gobuster"),
+    )
     return (output or "") + f"\n\n[retry --exclude-length {length}]\n" + retry_out
 
 
@@ -1248,7 +1404,13 @@ def _retry_ffuf_filter(output: str, command: list, timeout: int) -> str:
     retry_cmd = list(command) + ["-fs", size]
     print(f"  [*] ffuf catch-all size {size} — retrying with -fs {size}")
     print(f"  [*] {' '.join(str(c) for c in retry_cmd)}")
-    retry_out = run_tool(retry_cmd, timeout=timeout, tool_name="ffuf", allow_retry=False)
+    retry_out = run_tool(
+        retry_cmd,
+        timeout=timeout,
+        tool_name="ffuf",
+        allow_retry=False,
+        **_run_tool_timeout_kwargs("ffuf"),
+    )
     return (output or "") + f"\n\n[retry -fs {size}]\n" + retry_out
 
 
@@ -1291,19 +1453,32 @@ def _finalize_command(logical_name: str, command: list, target: str) -> list:
     return command
 
 
-def _run_configured(binary: str, target: str, allow_retry: bool = True) -> str:
-    cfg = get_tool_config(binary)
+def _run_configured(
+    binary: str,
+    target: str,
+    allow_retry: bool = True,
+    profile: str = None,
+    scenario: str = None,
+    quiet: bool = False,
+) -> str:
+    cfg = resolve_profile(get_tool_config(binary), profile)
     timeout = int(cfg.get("timeout", 120) or 120)
+    idle_reset, max_timeout = _timeout_policy(cfg)
     argv0 = resolve_tool_binary(binary)
-    command = _finalize_command(binary, build_command(argv0, target, cfg), target)
+    command = _finalize_command(
+        binary,
+        build_command(argv0, target, cfg, scenario=scenario, tool=binary, profile=profile),
+        target,
+    )
     print(f"  [*] {' '.join(str(c) for c in command)}")
     output = run_tool(
         command,
         timeout=timeout,
         tool_name=binary,
-        allow_retry=allow_retry,
-        idle_reset=bool(cfg.get("idle_reset")),
-        max_timeout=int(cfg.get("max_timeout") or 0),
+        allow_retry=allow_retry and not quiet,
+        idle_reset=idle_reset,
+        max_timeout=max_timeout,
+        quiet=quiet,
     )
     if binary == "gobuster":
         output = _retry_gobuster_wildcard(output, command, timeout)
@@ -1342,12 +1517,14 @@ def run_curl_headers(target: str) -> str:
     extra = substitute_args(list(cfg.get("extra_args") or []), target, cfg, wordlist=wordlist)
     http_url, https_url = _scheme_urls(target)
 
+    idle_kw = _run_tool_timeout_kwargs("curl", cfg)
     print(f"  [*] curl {' '.join(base_args + extra)} {http_url}")
     http_out = run_tool(
         ["curl"] + base_args + extra + [http_url],
         timeout=timeout,
         tool_name="curl",
         allow_retry=True,
+        **idle_kw,
     )
 
     https_cmd = ["curl"] + base_args + extra
@@ -1355,7 +1532,7 @@ def run_curl_headers(target: str) -> str:
         https_cmd.append("-k")
     https_cmd.append(https_url)
     print(f"  [*] curl {' '.join(base_args + extra)} -k {https_url}")
-    https_out = run_tool(https_cmd, timeout=timeout, tool_name="curl", allow_retry=True)
+    https_out = run_tool(https_cmd, timeout=timeout, tool_name="curl", allow_retry=True, **idle_kw)
 
     return f"[HTTP Headers]\n{http_out}\n\n[HTTPS Headers]\n{https_out}"
 
@@ -1375,6 +1552,7 @@ def run_dig(target: str) -> str:
             timeout=timeout,
             tool_name="dig",
             allow_retry=True,
+            **_run_tool_timeout_kwargs("dig", cfg),
         )
     return (
         f"[A Records]\n{records['A']}\n\n"
@@ -1472,7 +1650,13 @@ def run_playwright(target: str, allow_retry: bool = True) -> str:
     if cfg.get("allow_subdomains"):
         cmd.append("--allow-subdomains")
     print(f"  [*] playwright probe {url}")
-    return run_tool(cmd, timeout=timeout, tool_name="playwright", allow_retry=allow_retry)
+    return run_tool(
+        cmd,
+        timeout=timeout,
+        tool_name="playwright",
+        allow_retry=allow_retry,
+        **_run_tool_timeout_kwargs("playwright", cfg),
+    )
 
 
 def run_searchsploit(target: str) -> str:
@@ -1500,7 +1684,13 @@ def run_searchsploit(target: str) -> str:
     extra = substitute_args(list(cfg.get("extra_args") or []), query, cfg, wordlist=wordlist)
     command = [argv0] + prefix + extra + terms
     print(f"  [*] {' '.join(str(c) for c in command)}")
-    return run_tool(command, timeout=timeout, tool_name="searchsploit", allow_retry=True)
+    return run_tool(
+        command,
+        timeout=timeout,
+        tool_name="searchsploit",
+        allow_retry=True,
+        **_run_tool_timeout_kwargs("searchsploit", cfg),
+    )
 
 
 def run_gau(target: str) -> str:
@@ -1539,8 +1729,7 @@ def run_masscan(target: str) -> str:
             timeout=timeout,
             tool_name="masscan",
             allow_retry=True,
-            idle_reset=bool(cfg.get("idle_reset")),
-            max_timeout=int(cfg.get("max_timeout") or 0),
+            **_run_tool_timeout_kwargs("masscan", cfg),
         )
         blob = output or ""
         if (
@@ -1623,22 +1812,159 @@ DEFAULT_RECON_KEYS = ["1", "2", "3", "4", "5"]
 ALL_TOOL_KEYS = list(TOOLS_MENU.keys())
 
 
+def _job_label(job: dict) -> str:
+    return format_tool_call(
+        job.get("tool") or "",
+        job.get("target") or "",
+        job.get("profile") or "",
+        job.get("scenario") or "",
+    )
+
+
+def run_dispatch_jobs(
+    jobs: list,
+    ran_keys: set = None,
+    origin: str = "",
+    is_wp: bool = False,
+    is_lan=None,
+) -> tuple:
+    """
+    Run dispatch jobs in JSON waves. Partial failures are recorded and the
+    rest of the wave continues. Returns (results_dict, skip_notes, ran_keys).
+    """
+    ran_keys = set(ran_keys or [])
+    global_cfg = get_global_config()
+    origin = origin or ((jobs[0].get("target") if jobs else "") or "")
+    if is_lan is None:
+        is_lan = bool(lan_ips_for_target(origin)[0])
+
+    accepted = []
+    notes = []
+    for job in jobs or []:
+        if not isinstance(job, dict) or not job.get("tool"):
+            continue
+        ok, job, reason = apply_safety_gates(
+            job, ran_keys, origin, is_wp, is_lan, global_cfg,
+        )
+        if not ok:
+            notes.append(reason)
+            print(f"  {reason}")
+            continue
+        accepted.append(job)
+        ran_keys.add(job["_run_key"])
+
+    results = {}
+    max_global = int(global_cfg.get("max_workers") or 4) or 4
+    grouped = group_jobs_by_wave(accepted, get_waves_config())
+
+    for wave_name, wave_jobs, workers in grouped:
+        workers = min(max(int(workers) or 1, 1), max_global, len(wave_jobs))
+        print(f"\n[*] Wave {wave_name} ({len(wave_jobs)} tool(s), workers={workers})")
+        if workers == 1:
+            for job in wave_jobs:
+                label = _job_label(job)
+                started = time.monotonic()
+                try:
+                    out = run_tool_by_command(
+                        format_tool_call(
+                            job["tool"], job["target"],
+                            job.get("profile") or "", job.get("scenario") or "",
+                        ),
+                        quiet=False,
+                    )
+                except Exception as exc:
+                    out = f"[!] {job['tool']} failed: {exc}"
+                elapsed = int(time.monotonic() - started)
+                failed = (out or "").lstrip().startswith("[!]")
+                print(f"  [{'!' if failed else '+'}] {job['tool']} "
+                      f"{'failed' if failed else 'done'} {elapsed}s")
+                results[label] = out
+            continue
+
+        status = {_job_label(j): "queued" for j in wave_jobs}
+        stop = threading.Event()
+
+        def _heartbeat():
+            while not stop.wait(2):
+                running = [n for n, s in status.items() if s == "running"]
+                queued = [n for n, s in status.items() if s == "queued"]
+                with _print_lock:
+                    print(
+                        f"\r[wave {wave_name}] {len(running)} running "
+                        f"{','.join(running) or '-'} | queued {len(queued)}   ",
+                        end="",
+                        flush=True,
+                    )
+
+        hb = threading.Thread(target=_heartbeat, daemon=True)
+        hb.start()
+
+        def _one(job):
+            throttle_resources(global_cfg)
+            label = _job_label(job)
+            status[label] = "running"
+            started = time.monotonic()
+            try:
+                out = run_tool_by_command(
+                    format_tool_call(
+                        job["tool"], job["target"],
+                        job.get("profile") or "", job.get("scenario") or "",
+                    ),
+                    quiet=True,
+                )
+            except Exception as exc:
+                out = f"[!] {job['tool']} failed: {exc}"
+            status[label] = "done"
+            return label, out, int(time.monotonic() - started)
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(_one, j) for j in wave_jobs]
+                for fut in as_completed(futs):
+                    try:
+                        label, out, elapsed = fut.result()
+                    except Exception as exc:
+                        label, out, elapsed = "unknown", f"[!] failed: {exc}", 0
+                    results[label] = out
+                    failed = (out or "").lstrip().startswith("[!]")
+                    with _print_lock:
+                        print()
+                        print(
+                            f"  [{'!' if failed else '+'}] {label} "
+                            f"{'failed' if failed else 'done'} {elapsed}s"
+                        )
+        finally:
+            stop.set()
+            hb.join(timeout=1)
+            print()
+
+    return results, notes, ran_keys
+
+
+def run_named_tools(target: str, names: list) -> dict:
+    jobs = [
+        {"tool": name, "target": target, "profile": "", "scenario": ""}
+        for name in names
+    ]
+    results, notes, _ = run_dispatch_jobs(jobs, origin=target)
+    by_tool = {}
+    for label, out in results.items():
+        tool = (label.split() or [""])[0]
+        prev = by_tool.get(tool, "")
+        by_tool[tool] = (prev + "\n" + (out or "")).strip() if prev else (out or "")
+    if notes:
+        by_tool["skipped"] = "\n".join(notes)
+    return by_tool
+
+
 def run_default_recon(target: str) -> dict:
     """
     Run the standard recon pipeline (everything except nikto).
     Returns a dict of {tool_name: output_string}.
-    Nikto is excluded by default — too slow/noisy for auto-run.
     """
     print(f"\n[*] Starting recon on: {target}")
     print("─" * 50)
-
-    results = {}
-    results["nmap"] = run_nmap(target)
-    results["whois"] = run_whois(target)
-    results["whatweb"] = run_whatweb(target)
-    results["curl_headers"] = run_curl_headers(target)
-    results["dig"] = run_dig(target)
-
+    results = run_named_tools(target, ["whois", "dig", "curl", "whatweb", "nmap"])
     print("─" * 50)
     print("[+] Recon complete.\n")
     return results
@@ -1847,30 +2173,26 @@ def _sanitize_scenario_name(raw: str) -> str:
 
 def _extract_dispatch_scenario(parts: list) -> str:
     """Allowlisted SCENARIO:name / WORDLIST:name token from an AI TOOL tag."""
-    for token in parts[1:]:
-        match = WORDLIST_TAG_RE.match(token or "")
-        if match:
-            return _sanitize_scenario_name(match.group(1))
-    return ""
+    parsed = parse_tool_tag(" ".join(parts))
+    return parsed.get("scenario") or ""
+
+
+def _extract_dispatch_profile(parts: list) -> str:
+    parsed = parse_tool_tag(" ".join(parts))
+    return parsed.get("profile") or ""
 
 
 def _extract_dispatch_target(parts: list) -> str:
-    """Last non-flag, non-scenario token after the binary — host or URL."""
-    for token in reversed(parts[1:]):
-        if token.startswith("-") or _is_wordlist_tag(token):
-            continue
-        return token
-    return ""
+    """TARGET: value, or last non-flag, non-key token after the binary."""
+    parsed = parse_tool_tag(" ".join(parts))
+    return parsed.get("target") or ""
 
 
 def _extract_searchsploit_query(parts: list) -> str:
-    """Join remaining non-flag tokens — searchsploit ANDs product + version terms."""
-    tokens = []
-    for token in parts[1:]:
-        if not token or token.startswith("-") or _is_wordlist_tag(token):
-            continue
-        tokens.append(token)
-    return " ".join(tokens)
+    parsed = parse_tool_tag(" ".join(parts))
+    if parsed.get("tool") != "searchsploit":
+        parsed = parse_tool_tag("searchsploit " + " ".join(parts[1:]))
+    return parsed.get("target") or ""
 
 
 _JUNK_PATH_SEGMENTS = {
@@ -1893,78 +2215,60 @@ def _sanitize_dispatch_target(target: str) -> str:
     return raw
 
 
-def run_tool_by_command(command_str: str) -> str:
+def run_tool_by_command(command_str: str, quiet: bool = False) -> str:
     """
     AI dispatch: binary name is allowlisted; flags always come from
-    tools_config.json. Extra flags the model invents are ignored.
-    Optional SCENARIO:name / WORDLIST:name selects an allowlisted wordlist.
+    tools_config.json profiles. Extra flags the model invents are ignored.
+    Optional TARGET: / PROFILE: / SCENARIO: tokens.
     """
-    parts = command_str.strip().split()
-    if not parts:
+    parsed = parse_tool_tag(command_str)
+    tool = parsed.get("tool") or ""
+    if not tool:
         return "[!] Empty command."
-
-    tool = parts[0].lower().split("/")[-1]
     if tool not in ALLOWED_TOOLS:
-        return f"[!] Tool '{parts[0]}' is not permitted. Allowed: {ALLOWED_TOOLS}"
+        return f"[!] Tool '{tool}' is not permitted. Allowed: {ALLOWED_TOOLS}"
 
-    scenario = _extract_dispatch_scenario(parts)
-    if tool == "searchsploit":
-        target = _extract_searchsploit_query(parts)
-    else:
-        target = _extract_dispatch_target(parts)
+    scenario = parsed.get("scenario") or ""
+    profile = parsed.get("profile") or ""
+    target = parsed.get("target") or ""
     if not target:
-        return f"[!] No target in command. Use: [TOOL: {tool} TARGET]"
+        return f"[!] No target in command. Use: [TOOL: {tool} TARGET:<url>]"
     if tool != "searchsploit":
         cleaned = _sanitize_dispatch_target(target)
         if cleaned != target:
             print(f"  [!] Stripped junk path from TARGET: {target} → {cleaned}")
             target = cleaned
 
-    invented_flags = [p for p in parts[1:] if p.startswith("-")]
-    if invented_flags:
-        print(f"  [*] Ignoring model flags; using {CONFIG_PATH.name} for {tool}")
+    if parsed.get("invented_flags"):
+        print(f"  [*] Ignoring model flags; using {CONFIG_PATH.name} PROFILE for {tool}")
 
-    if tool == "playwright":
-        return run_playwright(target, allow_retry=False)
-    if tool == "curl":
-        return run_curl_headers(target)
-    if tool == "dig":
-        return run_dig(target)
-    if tool == "searchsploit":
-        return run_searchsploit(target)
-    if tool == "gau":
-        return run_gau(target)
-    if tool == "subfinder":
-        return run_subfinder(target)
-    if tool == "masscan":
-        return run_masscan(target)
+    try:
+        if tool == "playwright":
+            return run_playwright(target, allow_retry=False)
+        if tool == "curl":
+            return run_curl_headers(target)
+        if tool == "dig":
+            return run_dig(target)
+        if tool == "searchsploit":
+            return run_searchsploit(target)
+        if tool == "gau":
+            return run_gau(target)
+        if tool == "subfinder":
+            return run_subfinder(target)
+        if tool == "masscan":
+            return run_masscan(target)
 
-    config_key = "httpx" if tool == "httpx-toolkit" else tool
-    cfg = get_tool_config(config_key)
-    timeout = int(cfg.get("timeout", 120) or 120)
-    argv0 = resolve_tool_binary(config_key)
-    command = _finalize_command(
-        config_key,
-        build_command(argv0, target, cfg, scenario=scenario, tool=config_key),
-        target,
-    )
-    joined = " ".join(str(c) for c in command)
-    if target not in joined and _http_url(target) not in joined:
-        command.append(target)
-    print(f"  [*] {' '.join(str(c) for c in command)}")
-    output = run_tool(
-        command,
-        timeout=timeout,
-        tool_name=config_key,
-        allow_retry=False,
-        idle_reset=bool(cfg.get("idle_reset")),
-        max_timeout=int(cfg.get("max_timeout") or 0),
-    )
-    if config_key == "gobuster":
-        output = _retry_gobuster_wildcard(output, command, timeout)
-    if config_key == "ffuf":
-        output = _retry_ffuf_filter(output, command, timeout)
-    return output
+        config_key = "httpx" if tool == "httpx-toolkit" else tool
+        return _run_configured(
+            config_key,
+            target,
+            allow_retry=False,
+            profile=profile,
+            scenario=scenario,
+            quiet=quiet,
+        )
+    except Exception as exc:
+        return f"[!] {tool} failed: {exc}"
 
 
 # ─────────────────────────────────────────────
@@ -1972,15 +2276,15 @@ def run_tool_by_command(command_str: str) -> str:
 # ─────────────────────────────────────────────
 
 def _run_selected(target: str, keys: list) -> dict:
-    combined = {}
+    names = []
     for key in keys:
         if key not in TOOLS_MENU:
             print(f"[!] Unknown option: {key}")
             continue
-        name, func = TOOLS_MENU[key]
-        print(f"\n[*] Running {name}...")
-        combined[name] = func(target)
-    return combined
+        names.append(MENU_CONFIG_KEYS.get(key) or TOOLS_MENU[key][0])
+    if not names:
+        return {}
+    return run_named_tools(target, names)
 
 
 def interactive_tool_run(target: str) -> str:

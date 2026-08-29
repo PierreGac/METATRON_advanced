@@ -7,10 +7,12 @@ Model: metatron-qwen (fine-tuned from huihui_ai/qwen3.5-abliterated:9b)
 """
 
 import re
+from pathlib import Path
 from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
+from report_md import render_markdown_report, reports_dir, write_markdown_file
 from search import handle_search_dispatch
 from harvest import (
     already_reported_text,
@@ -29,37 +31,31 @@ from harvest import (
     schema_text_from_harvest,
     strip_ansi,
 )
+from dispatch import (
+    already_ran_text,
+    extract_tool_calls,
+    format_tool_call,
+    parse_tool_tag,
+    run_key,
+)
 from tools import (
-    _extract_dispatch_scenario,
-    _extract_dispatch_target,
-    _extract_searchsploit_query,
     _http_url,
-    is_domain_name,
+    current_results_dir,
     lan_ips_for_target,
     list_wordlist_scenarios,
-    run_tool_by_command,
+    run_dispatch_jobs,
 )
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "metatron-qwen"
 MAX_TOKENS = 8192
-MAX_TOOL_LOOPS = 15
+MAX_TOOL_LOOPS = 6
 OLLAMA_TIMEOUT = 800
 ANALYSIS_TEMPERATURE = 0.2
 
-WEB_MANDATORY = (
-    "nuclei", "sqlmap", "dalfox", "commix", "katana", "gobuster", "playwright", "ffuf", "wapiti", "zaproxy",
-)
 WEB_OPTIONAL = ("wapiti", "zaproxy")
-SCANNER_ORDER = (
-    "subfinder", "gau", "katana", "gobuster", "nuclei", "playwright", "zaproxy", "wapiti", "wpscan",
-)
-DISCOVERY_ORDER = ("subfinder", "gau", "katana", "gobuster", "nuclei", "playwright")
-OPTIONAL_SCANNERS = ("zaproxy", "wapiti")
-LAN_SCANNERS = ("masscan",)
-DOMAIN_DISCOVERY = ("subfinder", "gau")
-INJECTION_TOOLS = ("sqlmap", "dalfox", "commix", "wapiti")
-MAX_TOOLS_PER_ROUND = 4
+INJECTION_TOOLS = ("sqlmap", "dalfox", "commix")
+MAX_TOOLS_PER_ROUND = 8
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+", re.IGNORECASE)
@@ -112,69 +108,43 @@ ERROR_REPLY_PREFIXES = (
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are METATRON, a penetration testing assistant.
-Be precise and technical. No fluff. No markdown. No YAML.
+Plain text only. No markdown. No YAML. No flags.
 
-You drive real tools with tags. Flags always come from tools_config.json.
+You propose an action plan, then drive tools with tags.
+Argv always comes from tools_config.json profiles. You never invent -flags.
 
-  [TOOL: nuclei https://host/path]   → runs that tool against TARGET
-  [TOOL: gobuster https://host SCENARIO:wordpress]
-  [TOOL: ffuf https://host/api/v1 SCENARIO:api]
-  [SEARCH: CVE-2026-33017]           → DuckDuckGo lookup
+Tag format (all keys optional except name and TARGET):
+  [TOOL: <name> TARGET:<url-or-query> PROFILE:<default|aggressive|exploit> SCENARIO:<wordlist-key>]
+  [SEARCH: CVE-YYYY-NNNN]
 
-Rules for tags:
-- Write ONLY [TOOL: <name> <TARGET>] or [TOOL: <name> <TARGET> SCENARIO:<key>]
-  or [SEARCH: CVE-YYYY-NNNN].
-- SEARCH must be a real CVE id (CVE-2024-1234), never a site path.
-- TARGET may be the session host OR any discovered same-host URL
-  (example: [TOOL: dalfox https://example.com/search?q=test]).
-- Do not invent flags (-sV, -u, --batch, -silent, YAML, nuclei templates).
-- Do not invent paths like /fullpath. Extra flags are ignored.
-- To change paths, change TARGET only.
-- To change a gobuster/ffuf wordlist, use SCENARIO:<key> from the allowlist.
-  Never pass a filesystem path as a wordlist.
+Examples:
+  [TOOL: gobuster TARGET:https://example.com PROFILE:default SCENARIO:api]
+  [TOOL: sqlmap TARGET:https://example.com/search?q=test PROFILE:aggressive]
+  [TOOL: searchsploit TARGET:CVE-2024-1234 PROFILE:default]
+  [SEARCH: CVE-2024-1234]
 
-Allowed tool names:
-  nmap, whois, whatweb, curl, dig, nikto, gobuster, arp-scan, sslscan, testssl.sh,
-  katana, nuclei, httpx, ffuf, sqlmap, wapiti, dalfox, commix, wpscan, zaproxy, playwright,
-  searchsploit, gau, subfinder, masscan
+Output this round:
+1. PLAN: 3-8 short lines. Why these tools, which PROFILE, which URLs. No vuln table yet.
+2. Zero or more [TOOL: ...] and [SEARCH: ...] tags.
+3. If no further tools are needed, write PLAN: done and no TOOL tags.
 
-Wordlist scenarios (gobuster/ffuf unless noted):
-- wordpress — WordPress path discovery (gobuster, ffuf)
-- api — API endpoint discovery on /api/ paths (gobuster, ffuf)
-- backups — backup and leftover files (gobuster, ffuf)
-- sqli — SQL injection payloads (ffuf only; TARGET should have a query param)
-- xss — XSS payloads (ffuf only; TARGET should have a query param)
-- parameters — parameter-name fuzzing (ffuf only)
-
-How to use them:
-- subfinder then gau on a domain name (not an IP) to collect subdomains and known URLs.
-- katana/gobuster first on a web target to collect paths.
-- Then retarget sqlmap, dalfox, and commix at URLs with query strings or API paths
-  from DISCOVERED_URLS. Do not keep scanning only the origin homepage.
-- Skip catch-all SPA paths that all return the same homepage size.
-- nuclei/wapiti/zaproxy: origin or interesting paths.
-- curl: fetch a specific evidence URL (headers). Use this for Nuclei hit URLs.
-- [SEARCH: CVE-…] for every CVE that appears in tool output BEFORE you treat it as a finding.
-- searchsploit: product and version from nmap/whatweb, NEVER a URL
-  (example: [TOOL: searchsploit apache 2.4.49]).
-- masscan: LAN hosts only (RFC1918 / loopback). Never on a public IP or internet domain.
-- playwright: browser clicks. Cookie banners are probe blockers, not vulnerabilities.
-- wpscan only if the target is WordPress.
-- After default dir busting, use SCENARIO:wordpress on WP, SCENARIO:api on API paths,
-  SCENARIO:backups when hunting leftover files. Use sqli/xss/parameters with ffuf
-  on parameterized URLs only.
-
-During tool rounds write tags only. When the checklist is complete, write the
-VULN:/EXPLOIT:/RISK_LEVEL schema in plain text (same format as original METATRON).
+Rules:
+- SEARCH must be a real CVE id.
+- TARGET for searchsploit is a CVE or "product version", never a URL.
+- TARGET for other tools is the session host or a same-host discovered URL.
+- Do not invent paths like /fullpath.
+- Do not request PROFILE:exploit unless a prior detect/aggressive run on that endpoint showed a confirmed injection and SEARCH supports it.
+- At most one PROFILE:exploit tag per round. Prefer none.
+- Do not re-request a tool+endpoint+profile listed under ALREADY_RAN.
+- wpscan only if the target looks like WordPress.
+- masscan only if the digest says LAN.
+- playwright: cookie banners are not vulnerabilities.
+- Skip SPA catch-all paths that share the same homepage size.
 
 Accuracy:
-- nmap filtered or no-response is INCONCLUSIVE, not vulnerable.
-- Never assert a version that is not in scan output.
-- Never invent CVEs. Repeat a Nuclei CVE only after SEARCH, and name the product
-  in the template (e.g. Langflow). If the app does not match, it is unconfirmed.
-- Only CRITICAL with SEARCH plus endpoint evidence of exploitability.
-- Cookie overlays and WebGL/console deprecation noise are not vulns.
-- curl HTTP_CODE=000 means unreachable, not exploitable.
+- nmap filtered / no-response is INCONCLUSIVE.
+- Never invent CVEs or versions.
+- curl HTTP_CODE=000 means unreachable.
 """
 
 FINALIZE_PROMPT = """You are METATRON writing the saved pentest record.
@@ -627,37 +597,9 @@ def preferred_origin(target: str, recon: str) -> str:
     return _http_url(target)
 
 
-def missing_web_tools(
-    ran: set,
-    is_http: bool,
-    is_wp: bool,
-    discovered: list = None,
-    ran_injection_urls: dict = None,
-    retargeted: set = None,
-    is_domain: bool = False,
-    is_lan: bool = False,
-) -> list:
-    missing = []
-    needed = []
-    if is_domain:
-        needed.extend(DOMAIN_DISCOVERY)
-    if is_lan:
-        needed.extend(LAN_SCANNERS)
-    if is_http:
-        needed.extend(WEB_MANDATORY)
-        needed.extend(WEB_OPTIONAL)
-        if is_wp:
-            needed.append("wpscan")
-    if not needed:
-        return []
-    for name in needed:
-        if name in INJECTION_TOOLS:
-            if not injection_covered(name, ran, discovered, ran_injection_urls, retargeted):
-                missing.append(name)
-            continue
-        if name not in ran and name not in missing:
-            missing.append(name)
-    return missing
+def missing_web_tools(*_args, **_kwargs) -> list:
+    """Mandatory scanner checklist removed — AI plans follow-up tools."""
+    return []
 
 
 def injection_covered(
@@ -690,140 +632,56 @@ def pending_curl_urls(cve_urls: dict, curled_urls: set) -> list:
 
 
 def build_auto_dispatch(
-    missing: list,
     unverified_cves: list,
     cve_urls: dict,
-    discovered: list,
-    origin: str,
     curled_urls: set,
-    ran_tools: set = None,
-    ran_injection_urls: dict = None,
-    retargeted: set = None,
-    is_wp: bool = False,
-    ran_scenarios: set = None,
 ) -> list:
-    ran_tools = ran_tools or set()
-    ran_injection_urls = ran_injection_urls or {}
-    retargeted = retargeted if retargeted is not None else set()
-    ran_scenarios = ran_scenarios or set()
+    """Gap-only: SEARCH unverified CVEs and curl their hit URLs."""
     calls = []
     for cve in unverified_cves[:3]:
         calls.append(("SEARCH", cve))
         url = cve_urls.get(cve.upper())
         if url and url not in curled_urls:
-            calls.append(("TOOL", f"curl {url}"))
+            calls.append(("TOOL", format_tool_call("curl", url, "default")))
     if calls:
         return calls
-
     for url in pending_curl_urls(cve_urls, curled_urls)[:2]:
-        calls.append(("TOOL", f"curl {url}"))
-    if calls:
-        return calls
-
-    picked = []
-    for name in LAN_SCANNERS:
-        if name in missing:
-            picked.append(("TOOL", f"{name} {origin}"))
-            if len(picked) >= MAX_TOOLS_PER_ROUND:
-                return picked
-
-    for name in DISCOVERY_ORDER:
-        if name in missing:
-            picked.append(("TOOL", f"{name} {origin}"))
-            if len(picked) >= MAX_TOOLS_PER_ROUND:
-                return picked
-
-    if (
-        is_wp
-        and "gobuster" in ran_tools
-        and "gobuster:wordpress" not in ran_scenarios
-        and len(picked) < MAX_TOOLS_PER_ROUND
-    ):
-        picked.append(("TOOL", f"gobuster {origin} SCENARIO:wordpress"))
-        if len(picked) >= MAX_TOOLS_PER_ROUND:
-            return picked
-
-    inj = injection_target(origin, discovered)
-    for name in INJECTION_TOOLS:
-        if name not in missing:
-            continue
-        canon = _canonical_scan_url(inj)
-        already = ran_injection_urls.get(name, set())
-        if canon and canon in already:
-            continue
-        if name in ran_tools:
-            retargeted.add(name)
-        picked.append(("TOOL", f"{name} {inj}"))
-        if len(picked) >= MAX_TOOLS_PER_ROUND:
-            return picked
-
-    for name in OPTIONAL_SCANNERS:
-        if name in missing:
-            picked.append(("TOOL", f"{name} {origin}"))
-            if len(picked) >= MAX_TOOLS_PER_ROUND:
-                break
-    return picked
+        calls.append(("TOOL", format_tool_call("curl", url, "default")))
+    return calls
 
 
 def checklist_message(
-    missing: list,
     unverified_cves: list,
     discovered: list,
     loops_left: int,
     curl_pending: list = None,
+    ran_keys: set = None,
 ) -> str:
     lines = []
-    if missing:
-        lines.append("MISSING TOOLS (emit [TOOL: name TARGET] or they will be auto-run):")
-        lines.append(", ".join(missing))
+    lines.append(already_ran_text(ran_keys or set()))
     if unverified_cves:
-        lines.append("UNVERIFIED CVEs — emit [SEARCH: CVE-…] and [TOOL: curl <hit-url>] before calling them findings:")
+        lines.append("UNVERIFIED CVEs — emit [SEARCH: CVE-…] and [TOOL: curl TARGET:<hit-url>] before calling them findings:")
         lines.append(", ".join(unverified_cves))
     if curl_pending:
-        lines.append("CVE EVIDENCE URLS still need [TOOL: curl URL]:")
+        lines.append("CVE EVIDENCE URLS still need [TOOL: curl TARGET:<url>]:")
         lines.extend(curl_pending[:5])
     ranked = ranked_urls(discovered)[:20]
     if ranked:
-        lines.append("DISCOVERED_URLS (use these as TARGET for sqlmap/dalfox/commix when they have parameters):")
+        lines.append("DISCOVERED_URLS:")
         lines.extend(ranked)
     scenarios = list_wordlist_scenarios()
     if scenarios:
-        lines.append("WORDLIST SCENARIOS (optional [TOOL: gobuster|ffuf TARGET SCENARIO:name]):")
+        lines.append("WORDLIST SCENARIOS (optional SCENARIO:name on gobuster/ffuf):")
         lines.append(", ".join(scenarios))
-        lines.append(
-            "wordpress on WP, api on /api/ paths, backups for leftover files. "
-            "sqli/xss/parameters: ffuf only, on URLs with query params. Never pass a filesystem path."
-        )
-    if missing or unverified_cves or curl_pending:
-        lines.append("Do not write RISK_LEVEL yet. Emit tags only for the gaps above.")
-        lines.append(f"Loops left: {loops_left}")
-    else:
-        lines.append("Checklist complete. If you still need a tool, emit tags.")
-        lines.append("Otherwise write the VULN:/EXPLOIT:/RISK_LEVEL schema now (plain text, no markdown).")
+    lines.append("Emit PLAN: plus [TOOL: name TARGET:... PROFILE:...] tags, or PLAN: done if finished.")
+    lines.append("Do not write RISK_LEVEL yet.")
+    lines.append(f"Loops left: {loops_left}")
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
 # TOOL DISPATCH
 # ─────────────────────────────────────────────
-
-def extract_tool_calls(response: str) -> list:
-    """
-    Extract all [TOOL: ...] and [SEARCH: ...] tags from AI response.
-    Returns list of tuples: [("TOOL", "nmap -sV x.x.x.x"), ("SEARCH", "CVE...")]
-    """
-    calls = []
-
-    tool_matches = re.findall(r"\[TOOL:\s*(.+?)\]", response)
-    search_matches = re.findall(r"\[SEARCH:\s*(.+?)\]", response)
-
-    for m in tool_matches:
-        calls.append(("TOOL", m.strip()))
-    for m in search_matches:
-        calls.append(("SEARCH", m.strip()))
-
-    return calls
-
 
 def _search_is_cve(query: str) -> bool:
     return bool(CVE_RE.search(query or ""))
@@ -843,6 +701,7 @@ def _search_looks_like_fake_cve(query: str) -> bool:
 def sanitize_calls(calls: list, origin: str = "", is_wp: bool = False) -> list:
     """Drop junk SEARCH/TARGET tags the model invents."""
     cleaned = []
+    origin_host = _session_host(origin)
     for call_type, content in calls or []:
         if call_type == "SEARCH":
             if _search_looks_like_fake_cve(content) and not _search_is_cve(content):
@@ -853,30 +712,32 @@ def sanitize_calls(calls: list, origin: str = "", is_wp: bool = False) -> list:
         if call_type != "TOOL":
             cleaned.append((call_type, content))
             continue
-        parts = (content or "").split()
-        if not parts:
-            continue
-        tool = _canonical_tool(parts[0])
-        target = _extract_dispatch_target(parts)
-        scenario = _extract_dispatch_scenario(parts)
-        if tool == "searchsploit":
-            target = _extract_searchsploit_query(parts)
+        parsed = parse_tool_tag(content)
+        tool = _canonical_tool(parsed.get("tool") or "")
+        target = parsed.get("target") or ""
+        scenario = parsed.get("scenario") or ""
+        profile = parsed.get("profile") or ""
         if tool == "wpscan" and not is_wp:
             print("  [!] Ignoring wpscan — target does not look like WordPress.")
             continue
         if tool != "searchsploit" and target and _is_junk_target(target):
             if origin:
                 print(f"  [!] Replacing junk TARGET {target} with origin")
-                content = f"{tool} {origin}"
-                if scenario:
-                    content += f" SCENARIO:{scenario}"
                 target = origin
             else:
                 print(f"  [!] Ignoring TOOL {tool} with junk TARGET {target}")
                 continue
+        if tool != "searchsploit" and target and origin_host:
+            th = _session_host(target)
+            if th and th != origin_host and not th.endswith("." + origin_host):
+                print(f"  [!] Skipping {tool} — off-origin TARGET {target}")
+                continue
         if tool in INJECTION_TOOLS and target and _is_weak_injection_url(target):
             print(f"  [!] Ignoring {tool} on weak/static URL: {target}")
             continue
+        if parsed.get("invented_flags"):
+            print(f"  [*] Ignoring model flags on {tool}")
+        content = format_tool_call(tool, target, profile, scenario)
         cleaned.append(("TOOL", content))
     return cleaned
 
@@ -885,14 +746,13 @@ def _call_key(call: tuple) -> tuple:
     call_type, content = call
     if call_type == "SEARCH":
         return ("SEARCH", (content or "").strip().upper())
-    parts = (content or "").split()
-    tool = _canonical_tool(parts[0]) if parts else ""
-    if tool == "searchsploit":
-        target = _extract_searchsploit_query(parts) if parts else ""
-    else:
-        target = _extract_dispatch_target(parts) if parts else ""
-    scenario = _extract_dispatch_scenario(parts) if parts else ""
-    return ("TOOL", tool, target, scenario or "")
+    parsed = parse_tool_tag(content)
+    return ("TOOL",) + run_key(
+        _canonical_tool(parsed.get("tool") or ""),
+        parsed.get("target") or "",
+        parsed.get("profile") or "default",
+        parsed.get("scenario") or "",
+    )
 
 
 def merge_calls(model_calls: list, auto_calls: list, max_tools: int = MAX_TOOLS_PER_ROUND) -> list:
@@ -943,6 +803,7 @@ def record_calls(
     curled_urls: set,
     ran_injection_urls: dict = None,
     ran_scenarios: set = None,
+    ran_keys: set = None,
 ) -> None:
     for call_type, content in calls:
         if call_type == "SEARCH":
@@ -951,62 +812,78 @@ def record_calls(
             continue
         if call_type != "TOOL":
             continue
-        parts = content.split()
-        if not parts:
-            continue
-        tool = _canonical_tool(parts[0])
+        parsed = parse_tool_tag(content)
+        tool = _canonical_tool(parsed.get("tool") or "")
+        target = parsed.get("target") or ""
+        scenario = parsed.get("scenario") or ""
+        profile = parsed.get("profile") or "default"
         ran_tools.add(tool)
-        target = _extract_dispatch_target(parts)
-        scenario = _extract_dispatch_scenario(parts)
         if scenario and ran_scenarios is not None:
             ran_scenarios.add(f"{tool}:{scenario}")
         if tool == "curl" and target:
             curled_urls.add(_strip_url(target))
         if tool in INJECTION_TOOLS and target and ran_injection_urls is not None:
             ran_injection_urls.setdefault(tool, set()).add(_canonical_scan_url(target))
+        if ran_keys is not None:
+            ran_keys.add(run_key(tool, target, profile, scenario))
 
 
-def run_tool_calls(calls: list, session_host: str = "", is_wp: bool = False) -> str:
+def run_tool_calls(
+    calls: list,
+    session_host: str = "",
+    is_wp: bool = False,
+    origin: str = "",
+    ran_keys: set = None,
+    is_lan: bool = False,
+) -> tuple:
     """
-    Execute all tool/search calls and return combined evidence string.
+    Execute SEARCH sequentially and TOOL jobs in waves.
+    Returns (evidence_string, ran_keys).
     """
     if not calls:
-        return ""
+        return "", ran_keys or set()
 
+    ran_keys = set(ran_keys or [])
     results = ""
-    for call_type, call_content in calls:
-        print(f"\n  [DISPATCH] {call_type}: {call_content}")
+    jobs = []
 
-        if call_type == "TOOL":
-            parts = call_content.split()
-            tool = _canonical_tool(parts[0]) if parts else ""
-            target = _extract_dispatch_target(parts) if parts else ""
-            if tool == "wpscan" and not is_wp:
-                output = "[!] Skipping wpscan — target does not look like WordPress."
-                print(f"  {output}")
-            elif tool in INJECTION_TOOLS and target and _is_weak_injection_url(target):
-                output = f"[!] Skipping {tool} on weak/static URL: {target}"
-                print(f"  {output}")
-            elif target and _is_junk_target(target):
-                output = f"[!] Skipping {tool} — junk TARGET {target}"
-                print(f"  {output}")
-            else:
-                output = run_tool_by_command(call_content)
-        elif call_type == "SEARCH":
+    for call_type, call_content in calls:
+        if call_type == "SEARCH":
+            print(f"\n  [DISPATCH] SEARCH: {call_content}")
             if _search_looks_like_fake_cve(call_content) and not _search_is_cve(call_content):
                 output = f"[!] Skipping SEARCH — not a CVE id: {call_content}"
                 print(f"  {output}")
             else:
                 output = handle_search_dispatch(call_content)
-        else:
-            output = f"[!] Unknown call type: {call_type}"
+            compressed = summarize_tool_output(output.strip(), session_host)
+            results += f"\n[SEARCH RESULT: {call_content}]\n"
+            results += "─" * 40 + "\n"
+            results += compressed + "\n"
+            continue
+        if call_type != "TOOL":
+            continue
+        parsed = parse_tool_tag(call_content)
+        parsed["tool"] = _canonical_tool(parsed.get("tool") or "")
+        jobs.append(parsed)
 
-        compressed = summarize_tool_output(output.strip(), session_host)
-        results += f"\n[{call_type} RESULT: {call_content}]\n"
-        results += "─" * 40 + "\n"
-        results += compressed + "\n"
+    if jobs:
+        print(f"\n  [DISPATCH] {len(jobs)} tool job(s)")
+        job_results, notes, ran_keys = run_dispatch_jobs(
+            jobs,
+            ran_keys=ran_keys,
+            origin=origin or session_host,
+            is_wp=is_wp,
+            is_lan=is_lan,
+        )
+        for note in notes:
+            results += f"\n{note}\n"
+        for label, output in job_results.items():
+            compressed = summarize_tool_output((output or "").strip(), session_host)
+            results += f"\n[TOOL RESULT: {label}]\n"
+            results += "─" * 40 + "\n"
+            results += compressed + "\n"
 
-    return results
+    return results, ran_keys
 
 
 # ─────────────────────────────────────────────
@@ -1193,9 +1070,7 @@ def _run_gap_pass(target: str, vulns: list, exploits: list, leftovers: str) -> t
 def analyse_target(target: str, raw_scan: str) -> dict:
     host = _session_host(target)
     origin = preferred_origin(target, raw_scan)
-    is_http = looks_like_http(target, raw_scan)
     is_wp = looks_like_wordpress(raw_scan)
-    is_domain = is_domain_name(target)
     is_lan = bool(lan_ips_for_target(target)[0])
 
     ran_tools = tools_from_text(raw_scan)
@@ -1204,6 +1079,9 @@ def analyse_target(target: str, raw_scan: str) -> dict:
     ran_injection_urls = {}
     ran_scenarios = set()
     retargeted = set()
+    ran_keys = set()
+    for name in ran_tools:
+        ran_keys.add(run_key(name, origin, "default", ""))
     discovered = harvest_urls(raw_scan, host, origin=origin)
     all_cves = extract_cves(raw_scan)
     cve_urls = harvest_cve_urls(raw_scan, host)
@@ -1221,22 +1099,19 @@ def analyse_target(target: str, raw_scan: str) -> dict:
         {
             "role": "user",
             "content": (
-                f"TARGET: {target}\nORIGIN: {origin}\n\n"
+                f"TARGET: {target}\nORIGIN: {origin}\n"
+                f"LAN: {'yes' if is_lan else 'no'}\n\n"
                 f"{digest}\n\n"
+                f"{already_ran_text(ran_keys)}\n\n"
                 f"RECON HIGHLIGHTS:\n{recon_highlights}\n\n"
-                "This is a tool round. Emit [TOOL: name TARGET] and [SEARCH: CVE] tags.\n"
-                "TARGET may be a discovered URL, not only the origin.\n"
-                "Optional SCENARIO:name on gobuster/ffuf (wordpress, api, backups, sqli, xss, parameters).\n"
-                "Do not invent flags. Do not write RISK_LEVEL yet."
+                "Write PLAN: then [TOOL: name TARGET:... PROFILE:...] and [SEARCH: CVE] tags.\n"
+                "Do not invent flags. Do not write RISK_LEVEL yet.\n"
+                "If recon is enough, write PLAN: done with no TOOL tags."
             ),
         },
     ]
 
     for loop in range(MAX_TOOL_LOOPS):
-        missing = missing_web_tools(
-            ran_tools, is_http, is_wp, discovered, ran_injection_urls, retargeted,
-            is_domain=is_domain, is_lan=is_lan,
-        )
         unverified = [c for c in all_cves if c not in searched_cves]
         curl_pending = pending_curl_urls(cve_urls, curled_urls)
         loops_left = MAX_TOOL_LOOPS - loop
@@ -1253,32 +1128,38 @@ def analyse_target(target: str, raw_scan: str) -> dict:
 
         model_calls = sanitize_calls(extract_tool_calls(response), origin, is_wp)
         auto_calls = []
-        need_wp_wordlist = (
-            is_wp
-            and "gobuster" in ran_tools
-            and "gobuster:wordpress" not in ran_scenarios
-        )
-        if missing or unverified or curl_pending or need_wp_wordlist:
-            auto_calls = build_auto_dispatch(
-                missing, unverified, cve_urls, discovered, origin, curled_urls,
-                ran_tools, ran_injection_urls, retargeted,
-                is_wp=is_wp, ran_scenarios=ran_scenarios,
-            )
+        if unverified or curl_pending:
+            auto_calls = build_auto_dispatch(unverified, cve_urls, curled_urls)
         auto_calls = sanitize_calls(auto_calls, origin, is_wp)
         calls = merge_calls(model_calls, auto_calls)
         auto = bool(auto_calls) and any(c not in model_calls for c in calls)
         if auto and auto_calls:
             print(f"\n[*] Auto-dispatch fill ({len(auto_calls)} candidates): "
                   + ", ".join(f"{t} {c}" for t, c in auto_calls[:6]))
+
+        plan_done = bool(re.search(r"PLAN:\s*done\b", response or "", re.I))
         if not calls:
-            print("\n[*] Checklist complete or no further tools. Moving to finalize.")
-            break
+            if plan_done or loop > 0:
+                print("\n[*] No further tools. Moving to finalize.")
+                break
+            print("\n[*] No tool tags this round.")
+            messages.append({"role": "assistant", "content": response})
+            messages.append({
+                "role": "user",
+                "content": checklist_message(
+                    unverified, discovered, loops_left - 1, curl_pending, ran_keys,
+                ),
+            })
+            continue
 
         record_calls(
             calls, ran_tools, searched_cves, curled_urls, ran_injection_urls,
-            ran_scenarios=ran_scenarios,
+            ran_scenarios=ran_scenarios, ran_keys=None,
         )
-        tool_results = run_tool_calls(calls, session_host=host, is_wp=is_wp)
+        tool_results, ran_keys = run_tool_calls(
+            calls, session_host=host, is_wp=is_wp, origin=origin,
+            ran_keys=ran_keys, is_lan=is_lan,
+        )
         evidence_chunks.append(tool_results)
         scan_parts.append(tool_results)
         harvested = harvest_findings("\n".join(scan_parts), host=host)
@@ -1291,14 +1172,10 @@ def analyse_target(target: str, raw_scan: str) -> dict:
                 discovered.append(url)
 
         messages.append({"role": "assistant", "content": response})
-        missing = missing_web_tools(
-            ran_tools, is_http, is_wp, discovered, ran_injection_urls, retargeted,
-            is_domain=is_domain, is_lan=is_lan,
-        )
         unverified = [c for c in all_cves if c not in searched_cves]
         curl_pending = pending_curl_urls(cve_urls, curled_urls)
         nudge = checklist_message(
-            missing, unverified, discovered, loops_left - 1, curl_pending,
+            unverified, discovered, loops_left - 1, curl_pending, ran_keys,
         )
         prefix = "[AUTO-DISPATCH RESULTS]\n" if auto else "[TOOL RESULTS]\n"
         messages.append({
@@ -1306,17 +1183,8 @@ def analyse_target(target: str, raw_scan: str) -> dict:
             "content": f"{prefix}{tool_results}\n\n{digest}\n\n{nudge}",
         })
 
-        if (
-            not missing
-            and not unverified
-            and not curl_pending
-            and not (
-                is_wp
-                and "gobuster" in ran_tools
-                and "gobuster:wordpress" not in ran_scenarios
-            )
-        ):
-            print("\n[*] Tool checklist and CVE SEARCH complete.")
+        if plan_done and not unverified and not curl_pending:
+            print("\n[*] PLAN: done and CVE SEARCH complete.")
             break
 
     harvested = harvest_findings("\n".join(scan_parts), host=host)
@@ -1378,6 +1246,31 @@ def analyse_target(target: str, raw_scan: str) -> dict:
 
     print(f"\n[+] Parsed: {len(vulnerabilities)} vulns, {len(exploits)} exploits | Risk: {risk_level}")
 
+    tools_run = [already_ran_text(ran_keys).replace("ALREADY_RAN:\n", "").replace("(none)", "")]
+    tools_run = [ln for ln in already_ran_text(ran_keys).splitlines()[1:] if ln and ln != "(none)"]
+    md_text = render_markdown_report(
+        target,
+        risk=risk_level,
+        summary=summary,
+        vulns=vulnerabilities,
+        exploits=exploits,
+        tools_run=tools_run,
+    )
+    md_path = ""
+    dest_dir = current_results_dir()
+    if dest_dir is not None:
+        md_path = write_markdown_file(md_text, Path(dest_dir) / "report.md")
+        print(f"[+] Markdown report: {md_path}")
+    try:
+        md_copy = write_markdown_file(
+            md_text,
+            Path(reports_dir()) / "metatron_last.md",
+        )
+        if not md_path:
+            md_path = md_copy
+    except OSError:
+        pass
+
     return {
         "full_response": record_text,
         "vulnerabilities": vulnerabilities,
@@ -1385,6 +1278,9 @@ def analyse_target(target: str, raw_scan: str) -> dict:
         "risk_level": risk_level,
         "summary": summary,
         "raw_scan": raw_scan,
+        "ran_keys": tools_run,
+        "markdown": md_text,
+        "markdown_path": md_path,
     }
 
 

@@ -3,8 +3,28 @@
     "max_log_lines": 2000,
     "timeout_retry_multiplier": 2,
     "results_dir": "scan_results",
-    "wordlists_root": ""
+    "wordlists_root": "",
+    "max_workers": 4,
+    "ram_percent_limit": 85,
+    "load_per_cpu_limit": 2.0,
+    "max_injection_endpoints": 3,
+    "max_exploit_runs": 1,
+    "exploit_requires_detect": true,
+    "write_raw_logs": false,
+    "idle_reset": true
   },
+  "waves": [
+    {"name": "passive", "tools": ["whois", "dig", "curl", "whatweb"], "max_workers": 4, "depends_on": []},
+    {"name": "ports", "tools": ["nmap", "arp-scan", "masscan"], "max_workers": 1, "depends_on": ["passive"]},
+    {"name": "tls", "tools": ["sslscan", "testssl.sh"], "max_workers": 2, "depends_on": ["ports"]},
+    {"name": "http_probe", "tools": ["httpx"], "max_workers": 1, "depends_on": ["ports"]},
+    {"name": "crawl", "tools": ["katana", "gobuster", "ffuf", "gau", "subfinder"], "max_workers": 1, "depends_on": ["http_probe"]},
+    {"name": "browser", "tools": ["playwright"], "max_workers": 1, "depends_on": ["http_probe"]},
+    {"name": "vuln_scan", "tools": ["nuclei", "nikto", "wpscan"], "max_workers": 2, "depends_on": ["crawl"]},
+    {"name": "heavy_scan", "tools": ["wapiti", "zaproxy"], "max_workers": 1, "depends_on": ["crawl"]},
+    {"name": "inject", "tools": ["sqlmap", "dalfox", "commix"], "max_workers": 1, "depends_on": ["crawl"]},
+    {"name": "lookup", "tools": ["searchsploit"], "max_workers": 2, "depends_on": []}
+  ],
   "wordlists": {
     "wordpress": {
       "path": "Discovery/Web-Content/CMS/wordpress.fuzz.txt",
@@ -38,9 +58,9 @@
       "mode": "param"
     },
     "raft-large": {
-    "path": "Discovery/Web-Content/raft-large-directories.txt",
-    "tools": ["gobuster", "ffuf"],
-    "mode": "path"
+      "path": "Discovery/Web-Content/raft-large-directories.txt",
+      "tools": ["gobuster", "ffuf"],
+      "mode": "path"
     },
     "subdomains": {
       "path": "Discovery/DNS/subdomains-top1million-5000.txt",
@@ -60,116 +80,185 @@
   },
   "nmap": {
     "timeout": 180,
+    "default_profile": "default",
     "args": ["-sV", "-sC", "-T4", "--open", "{host}"],
     "extra_args": []
   },
   "whois": {
     "timeout": 30,
+    "default_profile": "default",
     "args": ["{host}"],
     "extra_args": []
   },
   "whatweb": {
     "timeout": 60,
+    "default_profile": "default",
     "args": ["-a", "3", "{target}"],
     "extra_args": []
   },
   "curl": {
     "timeout": 20,
+    "default_profile": "default",
     "args": ["-I", "--max-time", "10"],
     "extra_args": []
   },
   "dig": {
     "timeout": 15,
+    "default_profile": "default",
     "args": ["+short"],
     "extra_args": []
   },
   "nikto": {
     "timeout": 600,
+    "default_profile": "default",
     "args": ["-h", "{url}", "-ssl", "-nointeractive", "-Format", "html", "-o", "nikto_report.html"],
-    "extra_args": ["-Tuning", "1234567890abcde"]
+    "extra_args": [],
+    "profiles": {
+      "default": {},
+      "aggressive": {
+        "extends": "default",
+        "extra_args": ["-Tuning", "1234567890abcde"]
+      }
+    }
   },
   "gobuster": {
     "timeout": 600,
+    "default_profile": "default",
     "wordlist": "Discovery/Web-Content/raft-large-directories.txt",
     "args": ["dir", "-u", "{url}", "-w", "{wordlist}", "-r", "-e", "-t", "50", "-x", "php,html,txt,js,json,xml,bak,old,sql"],
     "extra_args": []
   },
   "arp-scan": {
     "timeout": 60,
+    "default_profile": "default",
     "args": ["--ignoredups", "{target}"],
     "extra_args": []
   },
   "sslscan": {
     "timeout": 240,
+    "default_profile": "default",
     "args": ["--no-colour", "{host}"],
     "extra_args": []
   },
   "testssl.sh": {
     "timeout": 600,
+    "default_profile": "default",
     "args": ["{host}", "--full", "--color", "0", "--jsonfile", "testssl.json"],
     "extra_args": []
   },
   "katana": {
     "timeout": 300,
     "depth": 5,
+    "default_profile": "default",
     "args": ["-u", "{url}", "-d", "{depth}", "-jc", "-kf", "-fx", "-ef", "jpg,png,gif,svg,mp4,webm,woff,woff2,css", "-af", "url,js,css"],
     "extra_args": []
   },
   "nuclei": {
     "timeout": 600,
+    "default_profile": "default",
     "args": ["-u", "{url}", "-severity", "critical,high,medium,low", "-tags", "cve,default-login,exposure,file,config,security-misconfiguration,ssl,tech,wordpress", "-rate-limit", "150"],
-    "extra_args": ["-stats", "-si", "50"]
+    "extra_args": [],
+    "profiles": {
+      "default": {},
+      "aggressive": {
+        "extends": "default",
+        "extra_args": ["-stats", "-si", "50"]
+      }
+    }
   },
   "httpx": {
     "timeout": 60,
+    "default_profile": "default",
     "args": ["-u", "{url}", "-title", "-tech-detect", "-status-code"],
     "extra_args": []
   },
   "ffuf": {
     "timeout": 600,
+    "default_profile": "default",
     "wordlist": "Discovery/Web-Content/directory-list-2.3-big.txt",
     "args": ["-u", "{url}/FUZZ", "-w", "{wordlist}", "-t", "50", "-fs", "0", "-ac", "-e", ".php,.html,.txt,.js,.json,.xml,.bak,.old,.sql,.inc,.config,.env"],
     "extra_args": ["-fc", "404,403"]
   },
   "sqlmap": {
     "timeout": 600,
-    "crawl": 3,
-    "args": ["-u", "{url}", "--batch", "--crawl={crawl}", "--level=5", "--risk=3", "--random-agent", "--threads=10", "--tamper=space2comment,randomcase"],
-    "extra_args": ["--os-shell"]
+    "default_profile": "default",
+    "args": ["-u", "{url}", "--batch", "--smart", "--random-agent", "--threads=4"],
+    "extra_args": [],
+    "profiles": {
+      "default": {},
+      "aggressive": {
+        "extends": "default",
+        "timeout": 900,
+        "args": ["-u", "{url}", "--batch", "--crawl=0", "--level=3", "--risk=2", "--random-agent", "--threads=4"]
+      },
+      "exploit": {
+        "extends": "aggressive",
+        "extra_args": ["--os-shell"]
+      }
+    }
   },
   "wapiti": {
     "timeout": 600,
     "idle_reset": true,
     "max_timeout": 5600,
+    "default_profile": "default",
     "args": ["-u", "{url}", "-v", "2", "-m", "all", "--flush-session", "--scope", "domain"],
     "extra_args": []
   },
   "dalfox": {
     "timeout": 300,
+    "default_profile": "default",
     "wordlist": "Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
-    "args": ["url", "{url}", "--verbose", "--mass", "--silence", "--custom-payload", "{wordlist}"],
-    "extra_args": []
+    "args": ["url", "{url}", "--silence", "--custom-payload", "{wordlist}"],
+    "extra_args": [],
+    "profiles": {
+      "default": {},
+      "aggressive": {
+        "extends": "default",
+        "extra_args": ["--mass", "--verbose"]
+      }
+    }
   },
   "commix": {
     "timeout": 600,
-    "crawl": 3,
-    "args": ["--url", "{url}", "--batch", "--crawl={crawl}", "--level=3", "--risk=3", "--cmd-delay=1", "--random-agent", "--force-ssl"],
-    "extra_args": ["--os-cmd=whoami"]
+    "default_profile": "default",
+    "args": ["--url", "{url}", "--batch", "--crawl=0", "--level=1", "--random-agent", "--force-ssl"],
+    "extra_args": [],
+    "profiles": {
+      "default": {},
+      "aggressive": {
+        "extends": "default",
+        "timeout": 900,
+        "args": ["--url", "{url}", "--batch", "--crawl=0", "--level=3", "--risk=2", "--cmd-delay=1", "--random-agent", "--force-ssl"]
+      },
+      "exploit": {
+        "extends": "aggressive",
+        "extra_args": ["--os-cmd=whoami"]
+      }
+    }
   },
   "wpscan": {
     "timeout": 600,
-    "args": ["--url", "{url}", "--enumerate", "vp,vt,tt,cb,dbe,u,m", "--plugins-detection", "mixed", "--random-user-agent"],
-    "extra_args": []
+    "default_profile": "default",
+    "args": ["--url", "{url}", "--random-user-agent"],
+    "extra_args": [],
+    "profiles": {
+      "default": {},
+      "aggressive": {
+        "extends": "default",
+        "args": ["--url", "{url}", "--enumerate", "vp,vt,tt,cb,dbe,u,m", "--plugins-detection", "mixed", "--random-user-agent"]
+      }
+    }
   },
   "zaproxy": {
     "timeout": 120,
     "idle_reset": true,
     "max_timeout": 5600,
+    "default_profile": "default",
     "args": [
       "-cmd",
       "-quickurl",
       "{url}",
-      "-quickprogress",
       "-config",
       "spider.maxChildren=50",
       "-config",
@@ -189,25 +278,30 @@
     "click_timeout_ms": 5000,
     "headless": true,
     "allowed_hosts": [],
-    "allow_subdomains": false
+    "allow_subdomains": false,
+    "default_profile": "default"
   },
   "searchsploit": {
     "timeout": 30,
+    "default_profile": "default",
     "args": ["--colour", "disable", "--www"],
     "extra_args": []
   },
   "gau": {
     "timeout": 180,
+    "default_profile": "default",
     "args": ["{host}", "--subs"],
     "extra_args": ["--blacklist", "png,jpg,gif,svg,woff,woff2,css,ico"]
   },
   "subfinder": {
     "timeout": 120,
+    "default_profile": "default",
     "args": ["-d", "{host}", "-silent"],
     "extra_args": []
   },
   "masscan": {
     "timeout": 180,
+    "default_profile": "default",
     "args": ["{target}", "-p1-65535", "--rate", "1000", "--wait", "3"],
     "extra_args": []
   }

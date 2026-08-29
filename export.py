@@ -13,7 +13,8 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 from reportlab.lib.enums import TA_CENTER
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+from report_md import render_markdown_report, reports_dir, write_markdown_file
+
 RECON_EXPORT_CHARS = 4000
 
 SEVERITY_COLORS = {
@@ -69,10 +70,39 @@ def fetch_all_history():
     return rows
 
 
-def reports_dir() -> str:
-    path = PROJECT_ROOT / "reports"
-    path.mkdir(parents=True, exist_ok=True)
-    return str(path)
+def export_markdown(data: dict, output_dir: str) -> str:
+    h = data["history"]
+    sl = h[0]
+    tgt = h[1]
+    date = str(h[2])
+    risk = data["summary"][4] if data["summary"] else "UNKNOWN"
+    summary = ""
+    if data.get("summary") and len(data["summary"]) > 3:
+        summary = str(data["summary"][3] or "")
+    fixes_by_vuln = {}
+    for fix in data.get("fixes") or []:
+        vid = fix[1] if len(fix) > 1 else None
+        if vid is not None:
+            fixes_by_vuln.setdefault(vid, []).append(fix[3] if len(fix) > 3 else "")
+    vulns = []
+    for v in data.get("vulns") or []:
+        item = {
+            "vuln_name": v[2] if len(v) > 2 else "finding",
+            "severity": v[3] if len(v) > 3 else "medium",
+            "port": v[4] if len(v) > 4 else "",
+            "service": v[5] if len(v) > 5 else "",
+            "description": v[6] if len(v) > 6 else "",
+            "fix": " ".join(x for x in fixes_by_vuln.get(v[0], []) if x),
+        }
+        vulns.append(item)
+    os.makedirs(output_dir, exist_ok=True)
+    safe = tgt.replace("https://", "").replace("http://", "").replace("/", "_").replace(".", "_")
+    path = Path(output_dir) / f"metatron_SL{sl}_{safe}.md"
+    text = render_markdown_report(
+        tgt, sl_no=sl, risk=risk, summary=summary, vulns=vulns,
+        exploits=data.get("exploits") or [], date=date,
+    )
+    return write_markdown_file(text, path)
 
 
 def _recon_excerpt(data: dict) -> str:
@@ -414,8 +444,9 @@ def export_menu(data: dict):
     print(f"\n\033[33m{'─'*20} EXPORT SL#{sl} — {tgt} {'─'*20}\033[0m")
     print("  [1] PDF report")
     print("  [2] HTML report")
-    print("  [3] Both")
-    print("  [4] Back")
+    print("  [3] Markdown report")
+    print("  [4] PDF + HTML + Markdown")
+    print("  [5] Back")
     print(f"\033[90m{'─'*60}\033[0m")
 
     choice     = input("\033[36mExport format: \033[0m").strip()
@@ -428,11 +459,16 @@ def export_menu(data: dict):
         p = export_html(data, output_dir)
         print(f"\033[92m[+] HTML saved: {p}\033[0m")
     elif choice == "3":
+        p = export_markdown(data, output_dir)
+        print(f"\033[92m[+] Markdown saved: {p}\033[0m")
+    elif choice == "4":
         p1 = export_pdf(data, output_dir)
         p2 = export_html(data, output_dir)
+        p3 = export_markdown(data, output_dir)
         print(f"\033[92m[+] PDF  : {p1}\033[0m")
         print(f"\033[92m[+] HTML : {p2}\033[0m")
-    elif choice == "4":
+        print(f"\033[92m[+] MD   : {p3}\033[0m")
+    elif choice == "5":
         return
     else:
         print("\033[93m[!] Invalid choice.\033[0m")
