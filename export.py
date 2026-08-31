@@ -5,7 +5,6 @@ import os
 import datetime
 from pathlib import Path
 
-import mysql.connector
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -14,6 +13,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.enums import TA_CENTER
 
 from report_md import render_markdown_report, reports_dir, write_markdown_file
+from db import get_connection
 
 RECON_EXPORT_CHARS = 4000
 
@@ -34,15 +34,6 @@ RISK_COLORS = {
 }
 
 
-def get_connection():
-    return mysql.connector.connect(
-        host="localhost",
-        user="metatron",
-        password="123",
-        database="metatron"
-    )
-
-
 def fetch_session(sl_no: int) -> dict:
     conn = get_connection()
     c = conn.cursor()
@@ -54,11 +45,13 @@ def fetch_session(sl_no: int) -> dict:
     fixes = c.fetchall()
     c.execute("SELECT * FROM exploits_attempted WHERE sl_no = %s", (sl_no,))
     exploits = c.fetchall()
+    c.execute("SELECT * FROM attacks WHERE sl_no = %s", (sl_no,))
+    attacks = c.fetchall()
     c.execute("SELECT * FROM summary WHERE sl_no = %s", (sl_no,))
     summary = c.fetchone()
     conn.close()
     return {"history": history, "vulns": vulns, "fixes": fixes,
-            "exploits": exploits, "summary": summary}
+            "exploits": exploits, "attacks": attacks, "summary": summary}
 
 
 def fetch_all_history():
@@ -100,7 +93,8 @@ def export_markdown(data: dict, output_dir: str) -> str:
     path = Path(output_dir) / f"metatron_SL{sl}_{safe}.md"
     text = render_markdown_report(
         tgt, sl_no=sl, risk=risk, summary=summary, vulns=vulns,
-        exploits=data.get("exploits") or [], date=date,
+        exploits=data.get("exploits") or [], attacks=data.get("attacks") or [],
+        date=date,
     )
     return write_markdown_file(text, path)
 
@@ -249,6 +243,42 @@ def export_pdf(data: dict, output_dir: str) -> str:
     else:
         story.append(Paragraph("No exploits recorded.", body_style))
 
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("Possible Attacks", h1_style))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                             color=colors.HexColor("#dddddd"), spaceAfter=6))
+    attacks = data.get("attacks") or []
+    if attacks:
+        for a in attacks:
+            sc = colors.HexColor(SEVERITY_COLORS.get((a[3] or "unknown").lower(), "#7f8c8d"))
+            lbl = ParagraphStyle("al", fontSize=9, fontName="Helvetica-Bold", textColor=sc)
+            story.append(Paragraph(
+                html_lib.escape(f"[{(a[3] or 'UNKNOWN').upper()}] {a[2] or 'attack'}"),
+                lbl,
+            ))
+            if a[4]:
+                story.append(Paragraph(
+                    f"<b>Target:</b> {html_lib.escape(str(a[4]))}", body_style
+                ))
+            if a[5]:
+                story.append(Paragraph(
+                    f"<b>Why this is dangerous:</b> {html_lib.escape(str(a[5]))}",
+                    body_style,
+                ))
+            if a[6]:
+                story.append(Paragraph(
+                    f"<b>Vulnerabilities used:</b> {html_lib.escape(str(a[6]))}",
+                    body_style,
+                ))
+            if a[7]:
+                story.append(Paragraph(
+                    f"<b>How to fix:</b> {html_lib.escape(str(a[7]))}",
+                    body_style,
+                ))
+            story.append(Spacer(1, 4))
+    else:
+        story.append(Paragraph("No possible attacks recorded.", body_style))
+
     recon = _recon_excerpt(data)
     if recon:
         story.append(Spacer(1, 6))
@@ -319,6 +349,20 @@ def export_html(data: dict, output_dir: str) -> str:
                      f"<td>{html_lib.escape(str(e[3] or '-'))}</td>"
                      f"<td><code>{html_lib.escape(str(e[4] or '-')[:80])}</code></td>"
                      f"<td>{html_lib.escape(str(e[5] or '-'))}</td></tr>")
+
+    atk_rows = ""
+    for a in data.get("attacks") or []:
+        sc = SEVERITY_COLORS.get((a[3] or "unknown").lower(), "#7f8c8d")
+        atk_rows += (
+            f"<tr><td>{a[0]}</td>"
+            f"<td><strong>{html_lib.escape(str(a[2] or ''))}</strong></td>"
+            f"<td><span style='color:{sc};font-weight:bold'>"
+            f"{(a[3] or 'unknown').upper()}</span></td>"
+            f"<td>{html_lib.escape(str(a[4] or '-'))}</td>"
+            f"<td>{html_lib.escape(str(a[5] or '-'))}</td>"
+            f"<td>{html_lib.escape(str(a[6] or '-'))}</td>"
+            f"<td><code>{html_lib.escape(str(a[7] or '-'))}</code></td></tr>"
+        )
 
     recon = _recon_excerpt(data)
     recon_html = ""
@@ -403,6 +447,11 @@ a{{color:#555}}
 <section>
   <h2>Exploits Attempted</h2>
   {'<table><thead><tr><th>#</th><th>Exploit</th><th>Tool</th><th>Payload</th><th>Result</th></tr></thead><tbody>' + exp_rows + '</tbody></table>' if data["exploits"] else '<p style="color:#888">None recorded.</p>'}
+</section>
+
+<section>
+  <h2>Possible Attacks</h2>
+  {'<table><thead><tr><th>#</th><th>Attack</th><th>Severity</th><th>Target</th><th>Why dangerous</th><th>Vulns used</th><th>How to fix</th></tr></thead><tbody>' + atk_rows + '</tbody></table>' if data.get("attacks") else '<p style="color:#888">None recorded.</p>'}
 </section>
 
 <section>

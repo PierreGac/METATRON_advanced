@@ -15,19 +15,23 @@ from db import (
     save_vulnerability,
     save_fix,
     save_exploit,
+    save_attack,
     save_summary,
     get_all_history,
     get_session,
     get_vulnerabilities,
     get_fixes,
     get_exploits,
+    get_attacks,
     edit_vulnerability,
     edit_fix,
     edit_exploit,
+    edit_attack,
     edit_summary_risk,
     delete_vulnerability,
     delete_exploit,
     delete_fix,
+    delete_attack,
     delete_full_session,
     print_history,
     print_session
@@ -216,6 +220,18 @@ def new_scan():
         )
         success(f"Saved exploit: {exp['exploit_name']}")
 
+    for atk in result.get("attacks") or []:
+        save_attack(
+            sl_no,
+            atk.get("attack_name", ""),
+            atk.get("severity", "medium"),
+            atk.get("target", ""),
+            atk.get("danger", ""),
+            atk.get("vulns_used", ""),
+            atk.get("fix", ""),
+        )
+        success(f"Saved attack: {atk.get('attack_name', '')}")
+
     # save summary
     save_summary(
         sl_no,
@@ -288,7 +304,9 @@ def edit_delete_menu(sl_no: int):
         print("  [6] Delete a fix")
         print("  [7] Delete an exploit")
         print("  [8] Delete FULL session (all tables)")
-        print("  [9] Back")
+        print("  [9] Edit an attack")
+        print("  [10] Delete an attack")
+        print("  [11] Back")
         divider()
 
         choice = prompt("Choice: ")
@@ -420,15 +438,51 @@ def edit_delete_menu(sl_no: int):
             if confirm(f"Delete exploit id={eid}?"):
                 delete_exploit(int(eid))
 
-        # ── DELETE FULL SESSION ───────────────
         elif choice == "8":
             if confirm(f"\n\033[91mPermanently delete ENTIRE session SL# {sl_no} from all tables?\033[0m"):
                 delete_full_session(sl_no)
                 success(f"Session SL# {sl_no} wiped.")
                 return   # go back to main menu
 
-        # ── BACK ──────────────────────────────
         elif choice == "9":
+            attacks = get_attacks(sl_no)
+            if not attacks:
+                warn("No attacks recorded for this session.")
+                continue
+
+            print("\n[ POSSIBLE ATTACKS ]")
+            for a in attacks:
+                print(f"  id={a[0]} | {a[2]} | {a[3]}")
+
+            aid = prompt("Enter attack id to edit: ")
+            if not aid.isdigit():
+                error("Invalid id.")
+                continue
+
+            print("  Fields: attack_name / severity / target / danger / vulns_used / fix_text")
+            field = prompt("Field to edit: ").strip()
+            value = prompt(f"New value for '{field}': ")
+            edit_attack(int(aid), field, value)
+
+        elif choice == "10":
+            attacks = get_attacks(sl_no)
+            if not attacks:
+                warn("No attacks to delete.")
+                continue
+
+            print("\n[ POSSIBLE ATTACKS ]")
+            for a in attacks:
+                print(f"  id={a[0]} | {a[2]} | {a[3]}")
+
+            aid = prompt("Enter attack id to delete: ")
+            if not aid.isdigit():
+                error("Invalid id.")
+                continue
+
+            if confirm(f"Delete attack id={aid}?"):
+                delete_attack(int(aid))
+
+        elif choice == "11":
             break
 
         else:

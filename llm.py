@@ -27,6 +27,8 @@ from harvest import (
     looks_like_schema as _looks_like_schema,
     merge_exploits,
     merge_vulns,
+    parse_attacks,
+    format_attacks_schema,
     pick_schema_text,
     schema_text_from_harvest,
     strip_ansi,
@@ -188,13 +190,35 @@ Rules:
 - If nothing new is evidenced, output exactly: NO_NEW_FINDINGS
 """
 
+ATTACK_PROMPT = """You are METATRON mapping confirmed scan findings to every realistic attack against this website.
+Output ONLY the schema below. No markdown, no backticks, no YAML, no headings, no emoji.
+
+ATTACK: <short name> | SEVERITY: <critical|high|medium|low>
+TARGET: <URL, endpoint, service, header, cookie, or component>
+DANGER: <why this is dangerous: impact on users, data, or the site>
+VULNS: <reported finding names or CVEs this attack uses>
+FIX: <concrete website and server changes that prevent this attack>
+
+Rules:
+- Exhaustively list every distinct attack the FINDINGS and SCAN DIGEST support.
+- Combine related findings into attack chains when they enable each other.
+- Every confirmed finding must appear in at least one VULNS line.
+- Do not invent CVEs, products, URLs, or vulnerabilities that are not in FINDINGS or DIGEST.
+- Do not write exploit payloads, PoCs, shell commands, or step-by-step attack instructions.
+- TARGET must be specific (path, port, header, cookie, or service from evidence).
+- FIX is mandatory and must be actionable (config, headers, patches, validation, auth, cookies).
+- Cookie banners and WebGL or console warnings are not attacks.
+- If nothing is evidenced, output exactly: NO_ATTACKS
+"""
+
 
 # ─────────────────────────────────────────────
 # OLLAMA API CALL
 # ─────────────────────────────────────────────
 
-def ask_ollama(messages: list, temperature: float = ANALYSIS_TEMPERATURE, retries: int = 1) -> str:
+def ask_ollama(messages: list, temperature: float = ANALYSIS_TEMPERATURE, retries: int = 1, num_predict: int = None) -> str:
     last = "[!] Model returned empty response."
+    predict = MAX_TOKENS if num_predict is None else num_predict
     for attempt in range(max(retries, 0) + 1):
         try:
             payload = {
@@ -202,7 +226,7 @@ def ask_ollama(messages: list, temperature: float = ANALYSIS_TEMPERATURE, retrie
                 "messages": messages,
                 "stream": False,
                 "options": {
-                    "num_predict": MAX_TOKENS,
+                    "num_predict": predict,
                     "temperature": temperature,
                     "top_p": 0.9,
                 },
@@ -931,7 +955,7 @@ def parse_vulnerabilities(response: str) -> list:
             j = i + 1
             while j < len(lines) and j <= i + 5:
                 next_line = _clean(lines[j])
-                if next_line.startswith(("VULN:", "EXPLOIT:", "RISK_LEVEL:", "SUMMARY:")):
+                if next_line.startswith(("VULN:", "EXPLOIT:", "ATTACK:", "RISK_LEVEL:", "SUMMARY:")):
                     break
                 if next_line.startswith("DESC:"):
                     vuln["description"] = next_line.replace("DESC:", "").strip()
@@ -980,7 +1004,7 @@ def parse_exploits(response: str) -> list:
             j = i + 1
             while j < len(lines) and j <= i + 4:
                 next_line = _clean(lines[j])
-                if next_line.startswith(("VULN:", "EXPLOIT:", "RISK_LEVEL:", "SUMMARY:")):
+                if next_line.startswith(("VULN:", "EXPLOIT:", "ATTACK:", "RISK_LEVEL:", "SUMMARY:")):
                     break
                 if next_line.startswith("RESULT:"):
                     exploit["result"] = next_line.replace("RESULT:", "").strip()
@@ -1009,7 +1033,7 @@ def parse_risk_level(response: str) -> str:
 
 def parse_summary(response: str) -> str:
     match = re.search(
-        r"SUMMARY:\s*(.+?)(?=\n\s*(?:VULN:|EXPLOIT:|RISK_LEVEL:|IMPORTANT:)|\Z)",
+        r"SUMMARY:\s*(.+?)(?=\n\s*(?:VULN:|EXPLOIT:|ATTACK:|RISK_LEVEL:|IMPORTANT:)|\Z)",
         response or "",
         re.IGNORECASE | re.DOTALL,
     )
@@ -1017,6 +1041,48 @@ def parse_summary(response: str) -> str:
         return ""
     text = re.sub(r"\s+", " ", match.group(1)).strip()
     return text[:800]
+
+
+def _findings_for_attack_pass(
+    target: str,
+    origin: str,
+    vulns: list,
+    exploits: list,
+    digest: str,
+) -> str:
+    parts = [
+        f"TARGET: {target}",
+        f"ORIGIN: {origin}",
+        "",
+        "FINDINGS:",
+    ]
+    if vulns:
+        for v in vulns:
+            parts.append(
+                f"VULN: {v.get('vuln_name','')} | SEVERITY: {v.get('severity','')} | "
+                f"PORT: {v.get('port','')} | SERVICE: {v.get('service','')}"
+            )
+            if v.get("description"):
+                parts.append(f"DESC: {v['description']}")
+            if v.get("fix"):
+                parts.append(f"FIX: {v['fix']}")
+            parts.append("")
+    else:
+        parts.append("(none)")
+        parts.append("")
+    if exploits:
+        parts.append("ATTEMPTS:")
+        for e in exploits:
+            parts.append(
+                f"EXPLOIT: {e.get('exploit_name','')} | TOOL: {e.get('tool_used','')} | "
+                f"RESULT: {e.get('result','')}"
+            )
+        parts.append("")
+    if digest:
+        blob = digest if len(digest) <= 8000 else digest[:8000] + "\n[truncated]"
+        parts.append("SCAN DIGEST:")
+        parts.append(blob)
+    return "\n".join(parts)
 
 
 def _pick_schema_text(finalize: str, transcript: list) -> str:
@@ -1061,6 +1127,38 @@ def _run_gap_pass(target: str, vulns: list, exploits: list, leftovers: str) -> t
     new_e = parse_exploits(reply)
     print(f"[*] Gap pass proposed: {len(new_v)} vulns, {len(new_e)} exploits")
     return new_v, new_e
+
+
+def _run_attack_pass(
+    target: str,
+    origin: str,
+    vulns: list,
+    exploits: list,
+    digest: str,
+) -> list:
+    """Final LLM pass: map findings to possible attacks and remediations."""
+    print(f"\n{'─'*60}")
+    print("[METATRON - Attack analysis]")
+    print(f"{'─'*60}")
+    user = _findings_for_attack_pass(target, origin, vulns, exploits, digest)
+    reply = ask_ollama(
+        [
+            {"role": "system", "content": ATTACK_PROMPT},
+            {"role": "user", "content": user},
+        ],
+        retries=2,
+        num_predict=max(MAX_TOKENS, 12288),
+    )
+    print(reply)
+    if not _usable_model_text(reply):
+        print("[*] Attack analysis empty — skipping.")
+        return []
+    if re.search(r"NO_ATTACKS", reply, re.IGNORECASE) and "ATTACK:" not in reply:
+        print("[*] Attack analysis: no attacks evidenced.")
+        return []
+    attacks = parse_attacks(reply)
+    print(f"[*] Attack analysis listed: {len(attacks)} attack(s)")
+    return attacks
 
 
 # ─────────────────────────────────────────────
@@ -1244,7 +1342,17 @@ def analyse_target(target: str, raw_scan: str) -> dict:
             vulnerabilities, exploits, risk_level, summary,
         )
 
-    print(f"\n[+] Parsed: {len(vulnerabilities)} vulns, {len(exploits)} exploits | Risk: {risk_level}")
+    attacks = _run_attack_pass(
+        target, origin, vulnerabilities, exploits, digest,
+    )
+    if attacks:
+        attack_block = format_attacks_schema(attacks)
+        record_text = (record_text or "").rstrip() + "\n\n" + attack_block
+
+    print(
+        f"\n[+] Parsed: {len(vulnerabilities)} vulns, {len(exploits)} exploits, "
+        f"{len(attacks)} attacks | Risk: {risk_level}"
+    )
 
     tools_run = [already_ran_text(ran_keys).replace("ALREADY_RAN:\n", "").replace("(none)", "")]
     tools_run = [ln for ln in already_ran_text(ran_keys).splitlines()[1:] if ln and ln != "(none)"]
@@ -1254,6 +1362,7 @@ def analyse_target(target: str, raw_scan: str) -> dict:
         summary=summary,
         vulns=vulnerabilities,
         exploits=exploits,
+        attacks=attacks,
         tools_run=tools_run,
     )
     md_path = ""
@@ -1275,6 +1384,7 @@ def analyse_target(target: str, raw_scan: str) -> dict:
         "full_response": record_text,
         "vulnerabilities": vulnerabilities,
         "exploits": exploits,
+        "attacks": attacks,
         "risk_level": risk_level,
         "summary": summary,
         "raw_scan": raw_scan,
@@ -1306,3 +1416,4 @@ if __name__ == "__main__":
     print(f"Summary    : {result['summary']}")
     print(f"Vulns found: {len(result['vulnerabilities'])}")
     print(f"Exploits   : {len(result['exploits'])}")
+    print(f"Attacks    : {len(result.get('attacks') or [])}")

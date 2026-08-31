@@ -32,7 +32,7 @@ You give it a target IP or domain. It runs recon and web-testing tools (nmap, wh
 - 🛠️ **Configurable tools** — `tools_config.json` for timeouts, flags, wordlists, crawl depth, ZAP limits, Playwright clicks
 - 📁 **Scan logs** — full live output saved under `scan_results/<target>/<timestamp>/`
 - 🌐 **Web Search** — DuckDuckGo search + CVE lookup (no API key needed)
-- 🗄️ **MariaDB Backend** — full scan history with 5 linked tables
+- 🗄️ **MariaDB Backend** — full scan history with 6 linked tables
 - ✏️ **Edit / Delete** — modify any saved result directly from the CLI
 - 🔁 **Agentic Loop** — AI can request more tool runs mid-analysis
 - 🚫 **No API Keys** — everything is free and local
@@ -201,7 +201,7 @@ go install github.com/ffuf/ffuf/v2@latest
 | zaproxy | `sudo apt install zaproxy` or install OWASP ZAP; binary may be `zap.sh` under `/usr/share/zaproxy/` (Metatron also looks for `zap.sh` / `owasp-zap`) |
 | nuclei / katana / httpx / subfinder | Go install + PATH as above |
 | gau | `go install github.com/lc/gau/v2/cmd/gau@latest` |
-| searchsploit | `sudo git clone https://github.com/offensive-security/exploitdb.git /opt/exploitdb` then `sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit`. Papers: `sudo git clone https://github.com/offensive-security/exploitdb-papers.git /opt/exploitdb-papers` (install.sh does this) |
+| searchsploit | Clone from **GitLab** (`https://gitlab.com/exploit-database/exploitdb.git`), not GitHub — `github.com/offensive-security/exploitdb` is a legacy stub without the `searchsploit` script. If `/opt/exploitdb` already exists, `git clone` will refuse. If `/opt/exploitdb/searchsploit` is present: `sudo chmod +x /opt/exploitdb/searchsploit && sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit`. If the folder is a stub or leftover junk: `sudo rm -rf /opt/exploitdb && sudo git clone https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb` then chmod + link as above. Papers: `sudo git clone https://gitlab.com/exploit-database/exploitdb-papers.git /opt/exploitdb-papers` (install.sh does this) |
 | masscan | `sudo apt install masscan` (LAN hosts only — Metatron refuses public IPs/domains) |
 | testssl.sh | `sudo apt install testssl.sh` or clone https://github.com/drwetter/testssl.sh |
 
@@ -370,6 +370,18 @@ CREATE TABLE summary (
                       generated_at DATETIME,
                       FOREIGN KEY (sl_no) REFERENCES history(sl_no)
 );
+
+CREATE TABLE attacks (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  sl_no       INT,
+  attack_name TEXT,
+  severity    VARCHAR(50),
+  target      TEXT,
+  danger      TEXT,
+  vulns_used  TEXT,
+  fix_text    TEXT,
+  FOREIGN KEY (sl_no) REFERENCES history(sl_no)
+);
 ```
 
 ---
@@ -453,7 +465,7 @@ or
 
 **5. Metatron runs selected tools in JSON-defined waves** (independent tools in parallel). Progress bars (`\r`, ZAP percent) are stripped from logs. Parallel waves show a heartbeat line instead of interleaving stdout. Timeouts in parallel do not prompt; the wave continues.
 
-**6. Results are fed to the AI.** The model writes a `PLAN:` then `[TOOL: name TARGET:... PROFILE:... SCENARIO:...]` tags. Flags always come from JSON **profiles** (`default` / `aggressive` / `exploit`). Duplicate (tool, endpoint, profile) runs are skipped. Auto-dispatch only fills CVE `[SEARCH:]` and evidence `curl`. A finalize pass writes `VULN:` / `RISK_LEVEL:` for MariaDB. A markdown report is written to `scan_results/<target>/<stamp>/report.md` and `reports/metatron_last.md`.
+**6. Results are fed to the AI.** The model writes a `PLAN:` then `[TOOL: name TARGET:... PROFILE:... SCENARIO:...]` tags. Flags always come from JSON **profiles** (`default` / `aggressive` / `exploit`). Duplicate (tool, endpoint, profile) runs are skipped. Auto-dispatch only fills CVE `[SEARCH:]` and evidence `curl`. A finalize pass writes `VULN:` / `RISK_LEVEL:` for MariaDB. A gap pass reviews leftover scanner lines. A final attack-analysis pass maps findings to possible attacks (target, impact, vulns used, and how to fix the site). A markdown report is written to `scan_results/<target>/<stamp>/report.md` and `reports/metatron_last.md`.
 
 **7. Everything is saved to MariaDB automatically.**
 
@@ -529,7 +541,7 @@ METATRON/
 
 ## 🗃️ Database Schema
 
-All 5 tables are linked by `sl_no` (session number) from the `history` table:
+All 6 tables are linked by `sl_no` (session number) from the `history` table:
 
 ```
 history              ← one row per scan session (sl_no is the spine)
@@ -539,6 +551,8 @@ history              ← one row per scan session (sl_no is the spine)
     │       └── fixes     ← fixes per vuln, linked by vuln_id + sl_no
     │
     ├── exploits_attempted ← exploits tried, linked by sl_no
+    │
+    ├── attacks           ← possible attacks from the final LLM pass, linked by sl_no
     │
     └── summary           ← full AI analysis dump, linked by sl_no
 ```

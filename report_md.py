@@ -15,6 +15,26 @@ def reports_dir() -> str:
     return str(path)
 
 
+def _attack_fields(attack) -> dict:
+    if isinstance(attack, dict):
+        return {
+            "name": attack.get("attack_name") or "attack",
+            "severity": attack.get("severity") or "medium",
+            "target": attack.get("target") or "",
+            "danger": attack.get("danger") or "",
+            "vulns": attack.get("vulns_used") or "",
+            "fix": attack.get("fix") or "",
+        }
+    return {
+        "name": attack[2] if len(attack) > 2 else "attack",
+        "severity": attack[3] if len(attack) > 3 else "medium",
+        "target": attack[4] if len(attack) > 4 else "",
+        "danger": attack[5] if len(attack) > 5 else "",
+        "vulns": attack[6] if len(attack) > 6 else "",
+        "fix": attack[7] if len(attack) > 7 else "",
+    }
+
+
 def render_markdown_report(
     target: str,
     sl_no="",
@@ -22,12 +42,14 @@ def render_markdown_report(
     summary="",
     vulns=None,
     exploits=None,
+    attacks=None,
     tools_run=None,
     notes="",
     date="",
 ) -> str:
     vulns = vulns or []
     exploits = exploits or []
+    attacks = attacks or []
     tools_run = tools_run or []
     date = date or datetime.datetime.now().isoformat(timespec="seconds")
     tools_line = ", ".join(str(t) for t in tools_run) if tools_run else "(none recorded)"
@@ -88,6 +110,19 @@ def render_markdown_report(
             result = exp[5] if len(exp) > 5 else ""
         lines.append(f"| {tool or name} | {payload} | {result} |")
     lines.append("")
+    lines.append("## Possible attacks")
+    lines.append("")
+    if not attacks:
+        lines.append("(none)")
+        lines.append("")
+    for i, attack in enumerate(attacks, 1):
+        a = _attack_fields(attack)
+        lines.append(f"### {i}. {a['name']} — {a['severity']}")
+        lines.append(f"- Target: {a['target'] or '(unspecified)'}")
+        lines.append(f"- Why this is dangerous: {a['danger'] or '(none)'}")
+        lines.append(f"- Vulnerabilities used: {a['vulns'] or '(none)'}")
+        lines.append(f"- How to fix: {a['fix'] or '(none)'}")
+        lines.append("")
     lines.append("## Notes")
     lines.append(
         (notes or "").strip()

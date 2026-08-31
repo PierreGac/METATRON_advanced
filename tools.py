@@ -55,11 +55,31 @@ TOOL_INSTALL_HINTS = {
     "zaproxy": "sudo apt install zaproxy  # binary may be zap.sh",
     "arp-scan": "sudo apt install arp-scan",
     "seclists": "sudo apt install seclists",
-    "searchsploit": "sudo git clone https://github.com/offensive-security/exploitdb.git /opt/exploitdb && sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit && sudo git clone https://github.com/offensive-security/exploitdb-papers.git /opt/exploitdb-papers",
+    "searchsploit": "sudo git clone https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb && sudo chmod +x /opt/exploitdb/searchsploit && sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit && sudo git clone https://gitlab.com/exploit-database/exploitdb-papers.git /opt/exploitdb-papers",
     "gau": "go install github.com/lc/gau/v2/cmd/gau@latest  # then: export PATH=\"$(go env GOPATH)/bin:$PATH\"",
     "subfinder": "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
     "masscan": "sudo apt install masscan",
 }
+
+
+def tool_install_hint(name: str) -> str:
+    """Install hint for a missing tool. searchsploit adapts if /opt/exploitdb already exists."""
+    if name == "searchsploit":
+        script = Path("/opt/exploitdb/searchsploit")
+        if script.is_file():
+            return (
+                "sudo chmod +x /opt/exploitdb/searchsploit && "
+                "sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit"
+            )
+        if Path("/opt/exploitdb").exists():
+            return (
+                "sudo rm -rf /opt/exploitdb && "
+                "sudo git clone https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb && "
+                "sudo chmod +x /opt/exploitdb/searchsploit && "
+                "sudo ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit"
+            )
+    return TOOL_INSTALL_HINTS.get(name, f"sudo apt install {name}")
+
 
 DEFAULT_WORDLIST = "Discovery/Web-Content/common.txt"
 DIRB_FALLBACKS = (
@@ -806,7 +826,7 @@ def resolve_tool_binary(logical_name: str) -> str:
     httpx: prefer httpx-toolkit / Go install over the Python httpx CLI.
     sqlmap: prefer GitHub /opt/sqlmap or venv over outdated apt.
     commix: prefer GitHub /opt/commix over outdated apt.
-    searchsploit: prefer GitHub /opt/exploitdb over apt exploitdb.
+    searchsploit: prefer GitLab /opt/exploitdb over apt exploitdb.
     wapiti: prefer venv wapiti3 over apt 3.0.x.
     zaproxy: also try zap.sh / owasp-zap.
     Optional tools_config.json field "binary" overrides.
@@ -832,7 +852,8 @@ def resolve_tool_binary(logical_name: str) -> str:
 
     if logical_name == "searchsploit":
         for candidate in (Path("/usr/local/bin/searchsploit"), Path("/opt/exploitdb/searchsploit")):
-            if candidate.is_file() and os.access(candidate, os.X_OK):
+            # A complete clone is enough; +x / PATH symlink may still be missing.
+            if candidate.is_file():
                 return str(candidate)
         return shutil.which("searchsploit") or "searchsploit"
 
@@ -1270,9 +1291,9 @@ def run_tool(
 
     except FileNotFoundError:
         hint_key = name or Path(binary).name
-        hint = TOOL_INSTALL_HINTS.get(hint_key) or TOOL_INSTALL_HINTS.get(
-            Path(binary).name, f"sudo apt install {Path(binary).name}"
-        )
+        if hint_key not in TOOL_INSTALL_HINTS:
+            hint_key = Path(binary).name
+        hint = tool_install_hint(hint_key)
         msg = f"[!] Tool not found: {binary} — install it with: {hint}"
         print(msg)
         _append_log_file(name, msg + "\n")
@@ -1682,7 +1703,10 @@ def run_searchsploit(target: str) -> str:
         wordlist=wordlist,
     )
     extra = substitute_args(list(cfg.get("extra_args") or []), query, cfg, wordlist=wordlist)
-    command = [argv0] + prefix + extra + terms
+    if Path(argv0).is_file() and not os.access(argv0, os.X_OK):
+        command = ["bash", argv0] + prefix + extra + terms
+    else:
+        command = [argv0] + prefix + extra + terms
     print(f"  [*] {' '.join(str(c) for c in command)}")
     return run_tool(
         command,
@@ -2006,6 +2030,9 @@ def _binary_available(path_or_name: str) -> str:
     path = Path(path_or_name)
     if path.is_file() and os.access(path_or_name, os.X_OK):
         return str(path)
+    # searchsploit is a bash script; a clone without +x is still usable via bash.
+    if path.is_file() and path.name == "searchsploit":
+        return str(path)
     found = shutil.which(path_or_name)
     return found or ""
 
@@ -2093,7 +2120,7 @@ def collect_install_status() -> list:
             "name": name,
             "ok": ok,
             "detail": detail,
-            "hint": TOOL_INSTALL_HINTS.get(name, f"sudo apt install {name}"),
+            "hint": tool_install_hint(name),
         })
     ok, detail = playwright_status()
     rows.append({

@@ -216,20 +216,39 @@ if ! command -v httpx-toolkit &>/dev/null && [[ -n "${GO_BIN:-}" && -x "$GO_BIN/
 fi
 
 echo "[*] searchsploit from GitHub (Exploit-DB + papers)..."
-if [[ -d /opt/exploitdb/.git ]]; then
-    git -C /opt/exploitdb pull --ff-only || true
-elif [[ ! -d /opt/exploitdb ]]; then
-    git clone https://github.com/offensive-security/exploitdb.git /opt/exploitdb || true
+clone_or_update_git() {
+    local dest="$1" url="$2"
+    if [[ -d "$dest/.git" ]]; then
+        git -C "$dest" pull --ff-only || true
+        return 0
+    fi
+    if [[ ! -e "$dest" ]] || [[ -d "$dest" && -z "$(ls -A "$dest" 2>/dev/null)" ]]; then
+        git clone "$url" "$dest" || true
+        return 0
+    fi
+    echo -e "${YELLOW}[!] $dest exists and is not a git clone.${NC}"
+    return 1
+}
+# Official tree is GitLab. github.com/offensive-security/exploitdb is a stub without searchsploit.
+if [[ -d /opt/exploitdb && ! -f /opt/exploitdb/searchsploit ]]; then
+    echo "[*] /opt/exploitdb has no searchsploit (stale GitHub stub?) — replacing..."
+    rm -rf /opt/exploitdb
+fi
+if ! clone_or_update_git /opt/exploitdb https://gitlab.com/exploit-database/exploitdb.git; then
+    if [[ ! -f /opt/exploitdb/searchsploit ]]; then
+        echo "    /opt/exploitdb has no searchsploit script. Replace it:"
+        echo "    sudo rm -rf /opt/exploitdb && sudo git clone https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb"
+    fi
 fi
 if [[ -f /opt/exploitdb/searchsploit ]]; then
     chmod +x /opt/exploitdb/searchsploit
     ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit
-    echo "[+] searchsploit -> /usr/local/bin/searchsploit (GitHub /opt/exploitdb)"
+    echo "[+] searchsploit -> /usr/local/bin/searchsploit (GitLab /opt/exploitdb)"
+else
+    echo -e "${YELLOW}[!] searchsploit script missing; symlink not created.${NC}"
 fi
-if [[ -d /opt/exploitdb-papers/.git ]]; then
-    git -C /opt/exploitdb-papers pull --ff-only || true
-elif [[ ! -d /opt/exploitdb-papers ]]; then
-    git clone https://github.com/offensive-security/exploitdb-papers.git /opt/exploitdb-papers || true
+if ! clone_or_update_git /opt/exploitdb-papers https://gitlab.com/exploit-database/exploitdb-papers.git; then
+    echo "    Papers are optional. To replace: sudo rm -rf /opt/exploitdb-papers && sudo git clone https://gitlab.com/exploit-database/exploitdb-papers.git /opt/exploitdb-papers"
 fi
 if [[ -f /opt/exploitdb/.searchsploit_rc ]]; then
     if [[ ! -f "$REAL_HOME/.searchsploit_rc" ]]; then
@@ -436,6 +455,17 @@ CREATE TABLE IF NOT EXISTS summary (
   generated_at DATETIME,
   FOREIGN KEY (sl_no) REFERENCES history(sl_no)
 );
+CREATE TABLE IF NOT EXISTS attacks (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  sl_no       INT,
+  attack_name TEXT,
+  severity    VARCHAR(50),
+  target      TEXT,
+  danger      TEXT,
+  vulns_used  TEXT,
+  fix_text    TEXT,
+  FOREIGN KEY (sl_no) REFERENCES history(sl_no)
+);
 SQL
     echo "[+] MariaDB schema applied (user metatron / password 123)"
 else
@@ -453,7 +483,11 @@ PATH_CHECK="$PATH"
 
 check_cmd() {
     local name="$1"
-    if command -v "$name" &>/dev/null || [[ -n "$GO_BIN" && -x "$GO_BIN/$name" ]] || [[ -x "$VENV/bin/$name" ]]; then
+    if command -v "$name" &>/dev/null \
+        || [[ -n "$GO_BIN" && -x "$GO_BIN/$name" ]] \
+        || [[ -x "$VENV/bin/$name" ]] \
+        || [[ -x "/usr/local/bin/$name" ]] \
+        || [[ "$name" == "searchsploit" && -f /opt/exploitdb/searchsploit ]]; then
         echo -e "  [${GREEN}✓${NC}] $name"
     else
         echo -e "  [${RED}✗${NC}] $name (missing)"

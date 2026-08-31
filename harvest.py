@@ -702,6 +702,86 @@ def already_reported_text(vulns: list, exploits: list) -> str:
     return "\n".join(lines) if lines else "(none)"
 
 
+def _schema_line(line: str) -> str:
+    line = re.sub(r"\*+", "", line or "")
+    return line.replace("`", "").strip()
+
+
+def parse_attacks(response: str) -> list:
+    """Parse ATTACK: blocks into dicts for reports and db.save_attack()."""
+    attacks = []
+    lines = (response or "").splitlines()
+    i = 0
+    while i < len(lines):
+        line = _schema_line(lines[i])
+        if not line.startswith("ATTACK:"):
+            i += 1
+            continue
+        attack = {
+            "attack_name": "",
+            "severity": "medium",
+            "target": "",
+            "danger": "",
+            "vulns_used": "",
+            "fix": "",
+        }
+        for part in line.split("|"):
+            part = part.strip()
+            if part.startswith("ATTACK:"):
+                attack["attack_name"] = part.replace("ATTACK:", "").strip()
+            elif part.startswith("SEVERITY:"):
+                attack["severity"] = part.replace("SEVERITY:", "").strip().lower()
+
+        current_field = None
+        j = i + 1
+        while j < len(lines):
+            next_line = _schema_line(lines[j])
+            if next_line.startswith("ATTACK:"):
+                break
+            if next_line.startswith(("VULN:", "EXPLOIT:", "RISK_LEVEL:", "SUMMARY:", "NO_ATTACKS")):
+                break
+            if next_line.startswith("TARGET:"):
+                attack["target"] = next_line.replace("TARGET:", "").strip()
+                current_field = "target"
+            elif next_line.startswith("DANGER:") or next_line.startswith("IMPACT:"):
+                attack["danger"] = re.sub(r"^(?:DANGER|IMPACT):", "", next_line).strip()
+                current_field = "danger"
+            elif next_line.startswith("VULNS:"):
+                attack["vulns_used"] = next_line.replace("VULNS:", "").strip()
+                current_field = "vulns_used"
+            elif next_line.startswith("FIX:") or next_line.startswith("REMEDIATION:"):
+                attack["fix"] = re.sub(r"^(?:FIX|REMEDIATION):", "", next_line).strip()
+                current_field = "fix"
+            elif next_line and current_field:
+                attack[current_field] = (attack[current_field] + " " + next_line).strip()
+            elif not next_line:
+                current_field = None
+            j += 1
+
+        if attack["attack_name"]:
+            attacks.append(attack)
+        i = j
+    return attacks
+
+
+def format_attacks_schema(attacks: list) -> str:
+    lines = []
+    for a in attacks or []:
+        lines.append(
+            f"ATTACK: {a.get('attack_name','')} | SEVERITY: {a.get('severity','medium')}"
+        )
+        if a.get("target"):
+            lines.append(f"TARGET: {a['target']}")
+        if a.get("danger"):
+            lines.append(f"DANGER: {a['danger']}")
+        if a.get("vulns_used"):
+            lines.append(f"VULNS: {a['vulns_used']}")
+        if a.get("fix"):
+            lines.append(f"FIX: {a['fix']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def looks_like_schema(text: str) -> bool:
     if not text:
         return False

@@ -13,14 +13,51 @@ from datetime import datetime
 # CONNECTION
 # ─────────────────────────────────────────────
 
+_attacks_table_ready = False
+
+ATTACKS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS attacks (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  sl_no       INT,
+  attack_name TEXT,
+  severity    VARCHAR(50),
+  target      TEXT,
+  danger      TEXT,
+  vulns_used  TEXT,
+  fix_text    TEXT,
+  FOREIGN KEY (sl_no) REFERENCES history(sl_no)
+)
+"""
+
+
+def _ensure_attacks_table(conn):
+    """Create attacks table on existing installs that predate this schema."""
+    global _attacks_table_ready
+    if _attacks_table_ready:
+        return
+    try:
+        c = conn.cursor()
+        c.execute(ATTACKS_TABLE_SQL)
+        conn.commit()
+        c.close()
+        _attacks_table_ready = True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def get_connection():
     """Returns a MariaDB connection. No password (local setup)."""
-    return mysql.connector.connect(
+    conn = mysql.connector.connect(
         host="localhost",
         user="metatron",
         password="123",
         database="metatron"
     )
+    _ensure_attacks_table(conn)
+    return conn
 
 
 # ─────────────────────────────────────────────
@@ -88,6 +125,27 @@ def save_exploit(sl_no, exploit_name, tool_used, payload, result, notes):
     conn.close()
 
 
+def save_attack(sl_no, attack_name, severity, target, danger, vulns_used, fix_text):
+    """Insert a possible-attack row derived from the final LLM pass."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO attacks
+        (sl_no, attack_name, severity, target, danger, vulns_used, fix_text)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (
+        sl_no,
+        str(attack_name or "")[:1000],
+        str(severity or "medium")[:50],
+        str(target or ""),
+        str(danger or ""),
+        str(vulns_used or ""),
+        str(fix_text or ""),
+    ))
+    conn.commit()
+    conn.close()
+
+
 def save_summary(sl_no: int, raw_scan: str, ai_analysis: str, risk_level: str):
     """Insert the full session summary."""
     conn = get_connection()
@@ -132,6 +190,9 @@ def get_session(sl_no: int) -> dict:
     c.execute("SELECT * FROM exploits_attempted WHERE sl_no = %s", (sl_no,))
     exploits = c.fetchall()
 
+    c.execute("SELECT * FROM attacks WHERE sl_no = %s", (sl_no,))
+    attacks = c.fetchall()
+
     c.execute("SELECT * FROM summary WHERE sl_no = %s", (sl_no,))
     summary = c.fetchone()
 
@@ -142,6 +203,7 @@ def get_session(sl_no: int) -> dict:
         "vulns":     vulns,
         "fixes":     fixes,
         "exploits":  exploits,
+        "attacks":   attacks,
         "summary":   summary
     }
 
@@ -168,6 +230,15 @@ def get_exploits(sl_no: int):
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM exploits_attempted WHERE sl_no = %s", (sl_no,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_attacks(sl_no: int):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM attacks WHERE sl_no = %s", (sl_no,))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -221,6 +292,23 @@ def edit_exploit(exploit_id: int, field: str, value: str):
     print(f"[+] exploits_attempted.{field} updated for id={exploit_id}")
 
 
+def edit_attack(attack_id: int, field: str, value: str):
+    """Edit a single field in attacks by id."""
+    allowed = {"attack_name", "severity", "target", "danger", "vulns_used", "fix_text"}
+    if field not in allowed:
+        print(f"[!] Invalid field: {field}. Allowed: {allowed}")
+        return
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        f"UPDATE attacks SET {field} = %s WHERE id = %s",
+        (value, attack_id)
+    )
+    conn.commit()
+    conn.close()
+    print(f"[+] attacks.{field} updated for id={attack_id}")
+
+
 def edit_summary_risk(sl_no: int, risk_level: str):
     """Update the risk level on a summary."""
     conn = get_connection()
@@ -256,6 +344,16 @@ def delete_exploit(exploit_id: int):
     print(f"[+] Exploit id={exploit_id} deleted.")
 
 
+def delete_attack(attack_id: int):
+    """Delete a single possible-attack row."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM attacks WHERE id = %s", (attack_id,))
+    conn.commit()
+    conn.close()
+    print(f"[+] Attack id={attack_id} deleted.")
+
+
 def delete_fix(fix_id: int):
     """Delete a single fix."""
     conn = get_connection()
@@ -268,13 +366,14 @@ def delete_fix(fix_id: int):
 
 def delete_full_session(sl_no: int):
     """
-    Wipe everything linked to a sl_no across all 5 tables.
+    Wipe everything linked to a sl_no across all 6 tables.
     Order matters — delete children before parent (FK constraints).
     """
     conn = get_connection()
     c = conn.cursor()
     c.execute("DELETE FROM fixes             WHERE sl_no = %s", (sl_no,))
     c.execute("DELETE FROM exploits_attempted WHERE sl_no = %s", (sl_no,))
+    c.execute("DELETE FROM attacks           WHERE sl_no = %s", (sl_no,))
     c.execute("DELETE FROM vulnerabilities   WHERE sl_no = %s", (sl_no,))
     c.execute("DELETE FROM summary           WHERE sl_no = %s", (sl_no,))
     c.execute("DELETE FROM history           WHERE sl_no = %s", (sl_no,))
@@ -323,6 +422,17 @@ def print_session(data: dict):
             print(f"  id={e[0]} | {e[2]} | Tool: {e[3]} | Result: {e[5]}")
             print(f"           Payload: {e[4]}")
             print(f"           Notes:   {e[6]}")
+    else:
+        print("  None recorded.")
+
+    print("\n[ POSSIBLE ATTACKS ]")
+    if data.get("attacks"):
+        for a in data["attacks"]:
+            print(f"  id={a[0]} | {a[2]} | Severity: {a[3]}")
+            print(f"           Target : {a[4]}")
+            print(f"           Danger : {a[5]}")
+            print(f"           Vulns  : {a[6]}")
+            print(f"           Fix    : {a[7]}")
     else:
         print("  None recorded.")
 
